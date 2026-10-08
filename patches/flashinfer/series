@@ -1,0 +1,4 @@
+0001-mla-fa2-allow-fp8-kv-on-sm12x.patch
+0002-mla-skip-snapshot-for-in-place-metadata.patch
+0003-mla-fa2-cap-fp8-kv-tile-at-32.patch
+0004-jit-distinct-uri-for-fa2-fp8-mla.patch

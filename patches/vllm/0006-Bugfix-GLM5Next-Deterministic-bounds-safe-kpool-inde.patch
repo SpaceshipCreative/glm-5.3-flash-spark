@@ -1,0 +1,482 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:19:00 -0400
+Subject: [PATCH 06/25] [Bugfix][GLM5Next] Deterministic, bounds-safe kpool
+ indexer top-k
+
+Three changes to the GLM5Next (GLM-5.3) NVIDIA kpool sparse indexer.
+
+(a) -1 initialization. The model and MTP topk_indices_buffer and the
+    per-call pool top-k tensors (prefill and decode) were torch.empty, so
+    any slot a kernel leaves unwritten (padded rows, padding columns, rows
+    shorter than k) held garbage indices. Allocate them with -1.
+
+(b) Pool id range mask. _expand_pools_and_append_tail_kernel only checked
+    pid >= 0. A pool id at or past pool_len (= seq_len // kpool, the
+    complete pools of the row) would expand to tokens beyond the sequence
+    or duplicate the tail, so treat it as invalid (-1).
+
+(c) Deterministic top-k, gated by VLLM_GLM5NEXT_DETERMINISTIC_TOPK
+    (default 1). The radix top-k kernels return the right pool set but in a
+    launch-dependent order, and keep a launch-dependent subset of pools
+    tied at the k-th score. Pools expand to token indices in list order and
+    sparse MLA accumulates in that order, so identical requests past
+    index_topk (2048) tokens diverge. New Triton kernel
+    canonicalize_pool_topk (nvidia/ops/pool_topk.py) rewrites each row to
+    the exact top-k with ties going to the lowest pool id, ids ascending,
+    -1 padded:
+    - prefill asks top_k_per_row_prefill for TOPK_TIE_SLACK (32) extra
+      candidates (capped at 2048), so boundary ties normally resolve from
+      the candidates;
+    - decode keeps the dispatcher's k, so the backend choice
+      (persistent/cooperative/per_row/...) is unchanged;
+    - when the k-th score equals the worst candidate's and the row has more
+      pools, the kernel rescans the row in id order (all scores above the
+      k-th, then the lowest-id ties).
+    The shared top-k dispatcher is not modified. Cost: one extra small
+    Triton launch per indexer layer and step, plus a row scan for rows
+    whose tie may extend past the candidates (every long decode row, since
+    decode has no extra candidates).
+
+Provenance:
+- (a) and (b) are from MiaAI-Lab glm53-flash_SM121.py
+  (bake_indexer_topk_neg1, bake_kpool_pid_clamp; MIT, Copyright (c) 2026
+  MiaAI-Lab), applied to v0.31.0's file layout and extended to the model
+  and MTP buffers.
+- (c) follows the approach Kindling (glm-5.3-flash-gx10) described in
+  dev/TOPK-CORRUPTION.md and its deterministic-topk patch (extra
+  candidates, lowest-id tie-break, ascending rows). That patch has no
+  license, so no code was taken from it; this kernel is an independent
+  implementation (int32 sort-based selection, different structure).
+
+Tests: tests/models/glm5next/test_kpool_canonical_topk.py (CUDA-only)
+checks the kernel against a reference for many candidate draws with heavy
+ties, ragged (prefill) and dense (decode) layouts, slack 0/1/32, a strided
+destination, and end to end after top_k_per_row_prefill.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/envs.py                                  |   9 +
+ vllm/models/glm5next/common/model.py          |   8 +-
+ vllm/models/glm5next/common/mtp.py            |   7 +-
+ .../glm5next/nvidia/ops/kpool_compress.py     |   5 +-
+ vllm/models/glm5next/nvidia/ops/pool_topk.py  | 183 ++++++++++++++++++
+ vllm/models/glm5next/nvidia/sparse_indexer.py |  65 ++++++-
+ 6 files changed, 262 insertions(+), 15 deletions(-)
+ create mode 100644 vllm/models/glm5next/nvidia/ops/pool_topk.py
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 490303606..a89f29747 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -60,6 +60,7 @@ if TYPE_CHECKING:
+     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
+     VLLM_XLA_CHECK_RECOMPILATION: bool = False
+     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
++    VLLM_GLM5NEXT_DETERMINISTIC_TOPK: bool = True
+     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
+     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
+     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
+@@ -1111,6 +1112,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
+         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+     ),
++    # GLM5Next (GLM-5.3) kpool indexer: canonicalize each pool top-k so that
++    # identical requests select identical pools in an identical order (exact
++    # top-k, ties at the k-th score to the lowest pool id, ids ascending).
++    # Costs one extra Triton pass per indexer layer. Set to 0 to use the raw
++    # top-k kernel output.
++    "VLLM_GLM5NEXT_DETERMINISTIC_TOPK": lambda: bool(
++        int(os.getenv("VLLM_GLM5NEXT_DETERMINISTIC_TOPK", "1"))
++    ),
+     # KV context length each adaptive-verification profiling request pretends to
+     # carry, so the profiled step reads a realistic amount of cache.
+     # Raise it for long-context deployments, where step cost is dominated by
+diff --git a/vllm/models/glm5next/common/model.py b/vllm/models/glm5next/common/model.py
+index 1c826f58b..ffc741340 100644
+--- a/vllm/models/glm5next/common/model.py
++++ b/vllm/models/glm5next/common/model.py
+@@ -643,9 +643,11 @@ class Glm5NextModel(nn.Module):
+             buffer_width = (
+                 (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n
+             ) * sparse_topk_block_n
+-            topk_indices_buffer = torch.empty(
+-                vllm_config.scheduler_config.max_num_batched_tokens,
+-                buffer_width,
++            # -1 (invalid) until the indexer writes a row: padded rows and
++            # columns are then masked rather than garbage indices.
++            topk_indices_buffer = torch.full(
++                (vllm_config.scheduler_config.max_num_batched_tokens, buffer_width),
++                -1,
+                 dtype=torch.int32,
+                 device=self.device,
+             )
+diff --git a/vllm/models/glm5next/common/mtp.py b/vllm/models/glm5next/common/mtp.py
+index 8361a053b..176808634 100644
+--- a/vllm/models/glm5next/common/mtp.py
++++ b/vllm/models/glm5next/common/mtp.py
+@@ -58,9 +58,10 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
+         buffer_width = (
+             (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n
+         ) * sparse_topk_block_n
+-        topk_indices_buffer = torch.empty(
+-            vllm_config.scheduler_config.max_num_batched_tokens,
+-            buffer_width,
++        # -1 (invalid) until the indexer writes a row.
++        topk_indices_buffer = torch.full(
++            (vllm_config.scheduler_config.max_num_batched_tokens, buffer_width),
++            -1,
+             dtype=torch.int32,
+             device=current_platform.device_type,
+         )
+diff --git a/vllm/models/glm5next/nvidia/ops/kpool_compress.py b/vllm/models/glm5next/nvidia/ops/kpool_compress.py
+index db496d300..b7fb6c748 100644
+--- a/vllm/models/glm5next/nvidia/ops/kpool_compress.py
++++ b/vllm/models/glm5next/nvidia/ops/kpool_compress.py
+@@ -872,7 +872,10 @@ def _expand_pools_and_append_tail_kernel(
+     o = cols % POOL_SIZE
+     pid = tl.load(pool_ids_ptr + row * pid_s0 + g, mask=mask & is_history, other=-1)
+     hist_val = (pid * POOL_SIZE + o).to(tl.int32)
+-    hist_out = tl.where(pid >= 0, hist_val, -1)
++    # Only complete pools [0, pool_len) are history; an id past them (stale or
++    # unwritten top-k slot) would index tokens beyond the sequence or repeat
++    # the tail, so drop it.
++    hist_out = tl.where((pid >= 0) & (pid < pool_len), hist_val, -1)
+ 
+     # Tail region [topk, out_cols): the request's trailing incomplete pool.
+     tail_off = cols - topk
+diff --git a/vllm/models/glm5next/nvidia/ops/pool_topk.py b/vllm/models/glm5next/nvidia/ops/pool_topk.py
+new file mode 100644
+index 000000000..c13f5c01c
+--- /dev/null
++++ b/vllm/models/glm5next/nvidia/ops/pool_topk.py
+@@ -0,0 +1,183 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Run-to-run deterministic pool top-k for the GLM5Next kpool indexer.
++
++The indexer's radix/histogram top-k kernels return the right set of pools,
++but in a launch-dependent order, and when several pools tie at the k-th score
++they keep a launch-dependent subset of the tied pools. The selected pools
++expand to token indices in list order and sparse MLA accumulates keys in that
++order, so either effect changes the rounding of the attention output. The
++next layer's indexer then scores different keys, and identical requests drift
++apart once the context exceeds ``index_topk`` tokens.
++
++``canonicalize_pool_topk`` rewrites a top-k result into one canonical form:
++the exact top-k by score, ties at the k-th score broken toward the lowest
++pool id, listed in ascending id order and -1 padded.
++"""
++
++from __future__ import annotations
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++# Extra candidates requested from a top-k kernel that accepts any k. Ties at
++# the k-th score that fit in the slack are resolved from the candidates alone;
++# longer ties fall back to a scan of the whole row.
++TOPK_TIE_SLACK = 32
++
++_SCAN_BLOCK = 1024
++
++
++@triton.jit
++def _score_sort_key(x):
++    # Reinterpret float32 as int32 so signed integer order matches float order
++    # (negative floats have their magnitude bits flipped).
++    bits = x.to(tl.int32, bitcast=True)
++    return tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
++
++
++@triton.jit
++def _pick(values, offs, i):
++    # values[i] of a 1-D block as a scalar.
++    return tl.sum(tl.where(offs == i, values, 0), axis=0)
++
++
++@triton.jit
++def _canonicalize_pool_topk_kernel(
++    cand_ptr,
++    cand_row_stride,
++    logits_ptr,
++    logits_row_stride,
++    logits_col_stride,
++    row_start_ptr,
++    row_end_ptr,
++    out_ptr,
++    out_row_stride,
++    num_cand,
++    k,
++    HAS_ROW_START: tl.constexpr,
++    BLOCK_C: tl.constexpr,
++    SCAN_BLOCK: tl.constexpr,
++):
++    INT32_MAX = 2147483647
++    INT32_MIN = -2147483648
++    row = tl.program_id(0).to(tl.int64)
++    row_end = tl.load(row_end_ptr + row).to(tl.int32)
++    if HAS_ROW_START:
++        row_start = tl.load(row_start_ptr + row).to(tl.int32)
++    else:
++        row_start = row_end - row_end
++    row_len = row_end - row_start
++    score_row = logits_ptr + row * logits_row_stride + row_start * logits_col_stride
++    out_row = out_ptr + row * out_row_stride
++
++    offs = tl.arange(0, BLOCK_C)
++    ids = tl.load(
++        cand_ptr + row * cand_row_stride + offs, mask=offs < num_cand, other=-1
++    )
++    ok = (ids >= 0) & (ids < row_len)
++    n_ok = tl.sum(ok.to(tl.int32), axis=0)
++    score = tl.load(score_row + ids * logits_col_stride, mask=ok, other=0.0)
++    key = tl.where(ok, _score_sort_key(score.to(tl.float32)), INT32_MIN)
++
++    # Score key of the k-th best candidate and of the worst valid candidate.
++    key_desc = tl.sort(key, descending=True)
++    kth_key = _pick(key_desc, offs, k - 1)
++    worst_key = _pick(key_desc, offs, n_ok - 1)
++    above = tl.sum((ok & (key > kth_key)).to(tl.int32), axis=0)
++    need = k - above
++
++    # Pools outside the candidates score at most worst_key. When the k-th score
++    # equals it and the row has pools beyond the candidates, some tied pools
++    # may be missing from the candidates, so rescan the row.
++    rescan = (
++        (n_ok == num_cand) & (row_len > n_ok) & (n_ok >= k) & (kth_key == worst_key)
++    )
++    if rescan:
++        written = tl.zeros((), dtype=tl.int32)
++        ties_left = need
++        for off in range(0, row_len, SCAN_BLOCK):
++            col = off + tl.arange(0, SCAN_BLOCK)
++            in_row = col < row_len
++            col_key = _score_sort_key(
++                tl.load(score_row + col * logits_col_stride, mask=in_row, other=0.0).to(
++                    tl.float32
++                )
++            )
++            is_tie = in_row & (col_key == kth_key)
++            take = (in_row & (col_key > kth_key)) | (
++                is_tie & (tl.cumsum(is_tie.to(tl.int32), axis=0) <= ties_left)
++            )
++            dst = written + tl.cumsum(take.to(tl.int32), axis=0) - 1
++            tl.store(out_row + dst, col, mask=take & (dst < k))
++            written += tl.sum(take.to(tl.int32), axis=0)
++            ties_left -= tl.sum(is_tie.to(tl.int32), axis=0)
++        for off in range(0, k, SCAN_BLOCK):
++            dst = off + tl.arange(0, SCAN_BLOCK)
++            tl.store(
++                out_row + dst,
++                tl.full((SCAN_BLOCK,), -1, tl.int32),
++                mask=(dst >= written) & (dst < k),
++            )
++    else:
++        # Lowest ids win among candidates tied at the k-th score: the need-th
++        # smallest tied id is the cut.
++        tied_ids = tl.sort(tl.where(ok & (key == kth_key), ids, INT32_MAX))
++        tie_cut = _pick(tied_ids, offs, need - 1)
++        keep = ok & (
++            (n_ok <= k) | (key > kth_key) | ((key == kth_key) & (ids <= tie_cut))
++        )
++        kept = tl.sort(tl.where(keep, ids, INT32_MAX))
++        tl.store(out_row + offs, tl.where(kept == INT32_MAX, -1, kept), mask=offs < k)
++
++
++def canonicalize_pool_topk(
++    candidates: torch.Tensor,
++    logits: torch.Tensor,
++    row_starts: torch.Tensor | None,
++    row_ends: torch.Tensor,
++    out: torch.Tensor,
++) -> None:
++    """Write each row's canonical top-k into ``out``.
++
++    Args:
++        candidates: ``[rows, C]`` int32 ids relative to each row's start, the
++            exact top-C of the row in any order, -1 padded. ``C >= k``; ids
++            past ``k`` let ties at the k-th score resolve without a rescan.
++        logits: ``[rows, L]`` float32 scores; row ``r`` covers columns
++            ``[row_starts[r], row_ends[r])``.
++        row_starts: ``[rows]`` int32 first column of each row, or None for 0.
++        row_ends: ``[rows]`` int32 exclusive end column of each row.
++        out: ``[rows, k]`` int32 destination; must not alias ``candidates``.
++            Receives the top-k ids (row-relative) in ascending order, ties at
++            the k-th score going to the lowest ids, -1 padded.
++
++    """
++    rows, num_cand = candidates.shape
++    k = out.shape[1]
++    assert out.shape[0] == rows and logits.shape[0] >= rows
++    assert 0 < k <= num_cand
++    assert candidates.dtype == torch.int32 and out.dtype == torch.int32
++    assert candidates.stride(1) == 1 and out.stride(1) == 1
++    assert row_ends.shape[0] >= rows
++    if rows == 0:
++        return
++    block_c = triton.next_power_of_2(num_cand)
++    _canonicalize_pool_topk_kernel[(rows,)](
++        candidates,
++        candidates.stride(0),
++        logits,
++        logits.stride(0),
++        logits.stride(1),
++        row_ends if row_starts is None else row_starts,
++        row_ends,
++        out,
++        out.stride(0),
++        num_cand,
++        k,
++        HAS_ROW_START=row_starts is not None,
++        BLOCK_C=block_c,
++        SCAN_BLOCK=_SCAN_BLOCK,
++        num_warps=8 if block_c >= 2048 else 4,
++    )
+diff --git a/vllm/models/glm5next/nvidia/sparse_indexer.py b/vllm/models/glm5next/nvidia/sparse_indexer.py
+index 00f51cc6a..090a60f29 100644
+--- a/vllm/models/glm5next/nvidia/sparse_indexer.py
++++ b/vllm/models/glm5next/nvidia/sparse_indexer.py
+@@ -10,7 +10,10 @@ from vllm.config import get_current_vllm_config_or_none
+ from vllm.forward_context import get_forward_context
+ from vllm.logger import init_logger
+ from vllm.model_executor.custom_op import CustomOp
+-from vllm.model_executor.layers.indexer_topk import get_indexer_topk
++from vllm.model_executor.layers.indexer_topk import (
++    SparseIndexerTopk,
++    get_indexer_topk,
++)
+ from vllm.models.glm5next.common.sparse_indexer import (
+     RADIX_TOPK_WORKSPACE_SIZE,
+     _build_decode_scatter_indices,
+@@ -22,6 +25,10 @@ from vllm.models.glm5next.common.sparse_indexer import (
+     kv_cache_as_quant_view,
+ )
+ from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
++from vllm.models.glm5next.nvidia.ops.pool_topk import (
++    TOPK_TIE_SLACK,
++    canonicalize_pool_topk,
++)
+ from vllm.platforms import current_platform
+ from vllm.utils.deep_gemm import has_deep_gemm
+ from vllm.utils.torch_utils import (
+@@ -121,6 +128,7 @@ def sparse_attn_indexer_kpool(
+     tail_kv_cache: torch.Tensor | None = None,
+     tail_prefix: str | None = None,
+     topk_backend: str = "auto",
++    deterministic_topk: bool = False,
+ ) -> torch.Tensor:
+     # careful! this will be None in dummy run
+     attn_metadata = get_forward_context().attn_metadata
+@@ -329,8 +337,9 @@ def sparse_attn_indexer_kpool(
+             # expand each pool back to its kpool constituent tokens.
+             select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
+             if index_kpool > 1:
+-                pool_topk = torch.empty(
+-                    (num_rows, select_k), dtype=torch.int32, device=logits.device
++                # -1 so slots the top-k kernel leaves unwritten stay invalid.
++                pool_topk = torch.full(
++                    (num_rows, select_k), -1, dtype=torch.int32, device=logits.device
+                 )
+                 topk_dst = pool_topk
+             else:
+@@ -338,16 +347,36 @@ def sparse_attn_indexer_kpool(
+                     chunk.token_start : chunk.token_end, :topk_tokens
+                 ]
+ 
++            if deterministic_topk:
++                # Ask for a few extra candidates so ties at the k-th score
++                # usually resolve without a row rescan, then keep the exact
++                # top select_k (lowest pool id wins ties) in ascending order.
++                # The kernel's final stage holds at most 2048 items.
++                num_cand = max(select_k, min(select_k + TOPK_TIE_SLACK, 2048))
++                topk_cand = torch.full(
++                    (num_rows, num_cand), -1, dtype=torch.int32, device=logits.device
++                )
++            else:
++                num_cand = select_k
++                topk_cand = topk_dst
+             torch.ops._C.top_k_per_row_prefill(
+                 logits,
+                 chunk.cu_seqlen_ks,
+                 chunk.cu_seqlen_ke,
+-                topk_dst,
++                topk_cand,
+                 num_rows,
+                 logits.stride(0),
+                 logits.stride(1),
+-                select_k,
++                num_cand,
+             )
++            if deterministic_topk:
++                canonicalize_pool_topk(
++                    topk_cand,
++                    logits,
++                    chunk.cu_seqlen_ks,
++                    chunk.cu_seqlen_ke,
++                    topk_dst,
++                )
+ 
+             if index_kpool > 1:
+                 pool_ids = pool_topk.to(torch.int64)
+@@ -565,13 +594,23 @@ def sparse_attn_indexer_kpool(
+         # then expand each pool back to its kpool tokens.
+         select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
+         if index_kpool > 1:
+-            pool_topk = torch.empty(
+-                (num_rows, select_k), dtype=torch.int32, device=logits.device
++            # -1 so slots the top-k kernel leaves unwritten stay invalid.
++            pool_topk = torch.full(
++                (num_rows, select_k), -1, dtype=torch.int32, device=logits.device
+             )
+             topk_dst = pool_topk
+         else:
+             topk_dst = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+ 
++        if deterministic_topk:
++            # Same k as the stock path so the backend choice is unchanged
++            # (persistent/cooperative only take k in 512/1024/2048); rows whose
++            # k-th score may tie outside the selection are rescanned.
++            topk_cand = torch.full(
++                (num_rows, select_k), -1, dtype=torch.int32, device=logits.device
++            )
++        else:
++            topk_cand = topk_dst
+         # Shared dispatcher with the DSA sparse indexer, so the kpool select
+         # honors kernel_config.sparse_indexer_topk_backend and picks between
+         # cooperative/persistent by batch size instead of always taking the
+@@ -580,10 +619,18 @@ def sparse_attn_indexer_kpool(
+             logits,
+             seq_lens,
+             next_n,
+-            topk_dst,
++            topk_cand,
+             select_k,
+             attn_metadata_narrowed.max_seq_len,
+         )
++        if deterministic_topk:
++            canonicalize_pool_topk(
++                topk_cand,
++                logits,
++                None,
++                SparseIndexerTopk._row_ends(seq_lens, next_n, num_rows),
++                topk_dst,
++            )
+ 
+         # Resolve to token-level indices in the output buffer.
+         if index_kpool > 1:
+@@ -658,6 +705,7 @@ class SparseAttnIndexerKpool(CustomOp):
+         self.topk_indices_buffer = topk_indices_buffer
+         self.skip_k_cache_insert = skip_k_cache_insert
+         self.use_fp4_cache = use_fp4_cache
++        self.deterministic_topk = envs.VLLM_GLM5NEXT_DETERMINISTIC_TOPK
+         if current_platform.is_cuda() and not has_deep_gemm():
+             raise RuntimeError(
+                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+@@ -743,4 +791,5 @@ class SparseAttnIndexerKpool(CustomOp):
+             self.tail_cache.kv_cache if self.tail_cache is not None else None,
+             self.tail_cache.prefix if self.tail_cache is not None else None,
+             self.topk_backend,
++            self.deterministic_topk,
+         )

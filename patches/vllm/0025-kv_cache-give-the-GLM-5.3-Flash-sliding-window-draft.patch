@@ -1,0 +1,926 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 06:07:42 -0400
+Subject: [PATCH 25/25] kv_cache: give the GLM-5.3-Flash sliding-window drafter
+ its own block pool
+
+With a DFlash2 drafter (5 sliding-window GQA layers, window 2048) on
+GLM-5.3-Flash, the previous commit gives the drafter KV cache groups of
+their own that draw block ids from the target's pool, so every
+2304-token block carries a page per draft layer: 30% of the KV cache at
+TP=4 and 46% at TP=2, though a sliding-window layer only ever holds its
+window.
+
+Give those groups a pool of their own:
+
+- DraftSlidingWindowSpec (a SlidingWindowSpec, so SlidingWindowManager
+  and its block recycling) marks the drafter's sliding-window layers
+  when the pool is on. Like the kpool tail it opts out of prefix
+  caching, which keeps its block size out of the hash block and
+  cache_config.block_size. That block size is 256 when it divides the
+  target block, else the target block; VLLM_GLM5NEXT_DRAFT_BLOCK_SIZE
+  overrides it and must divide the target block.
+- KVCacheConfig.draft_num_blocks is the pool's capacity, and
+  draft_pool_group_ids, draft_layer_names, num_blocks_of_group and
+  num_blocks_of say which ids and tensors index it.
+  _glm5_next_draft_pool_blocks sizes it for max_num_seqs windows
+  (window - 1 + retained + lookahead tokens, plus a block at each end),
+  the max_in_flight_tokens in flight, one request's admission cap (so
+  it does not refuse an admission the target's pool would grant) and
+  the null block.
+- get_kv_cache_config_from_groups takes the pool's bytes off the
+  available memory before dividing the rest into target blocks, and
+  lays the pool's tensors out after the target's. The target's offsets
+  and strides are the same as without a drafter. Bytes per block, max
+  concurrency, the peak-usage check, the num_gpu_blocks_override path
+  and the cross-worker min-blocks reconciliation leave the pool's
+  groups out of the per-block cost and add the pool once.
+- KVCacheCoordinator builds a second, uncached BlockPool for those
+  groups, and their managers allocate, recycle and free from it with
+  caching and zeroing off. get_num_blocks_to_allocate checks the pool's
+  free blocks. When the pool runs out it returns more blocks than the
+  target pool holds, so allocate_slots fails and the scheduler waits or
+  preempts, as it does when the target pool runs out.
+- Model Runner V2 keeps the pool's ids out of copy-on-write (kv_caches),
+  KV block zeroing, the warmup allocator (draft ids count and wrap in
+  their own pool) and dummy profiling contexts (set_dummy_context takes
+  a pool size per group). allocate_kv_cache already views each tensor
+  with num_blocks_of.
+
+Prefix caching: a hit covers the target only. The drafter's blocks
+inside its window start fresh, so drafts read unwritten context and
+acceptance can drop for up to one window (2048 tokens) after a hit. The
+target verifies every draft, so the output does not change. Because the
+drafter's group is both EAGLE-tagged and uncached, the target no longer
+loses its last hit block to the drafter's EAGLE drop.
+
+VLLM_GLM5NEXT_DRAFT_POOL (default 1) gates the pool. It also needs Model
+Runner V2, which DFlash2 heads run on, and no KV connector, HiSparse or
+context parallelism. If any of these is missing, or the gate is 0, the
+layout is the previous commit's.
+
+Source: the Kindling glm-5.3-flash-gx10 overlay,
+experimental/fixes/{kv_cache_utils,kv_cache_coordinator,
+kv_cache_interface,worker_utils,warmup}.py at commit c748079d. Its
+experimental/README.md lists these as vLLM files with Kindling's
+changes, keeping their Apache-2.0 headers; used with the owner's
+permission. Kindling bind-mounts the files over the image's copies.
+This commit reimplements the design natively against v0.31.0 and the
+previous commit, with these differences:
+- a spec type instead of env checks spread through the grouping and
+  sizing code;
+- the coordinator owns the second BlockPool;
+- the pool's size includes in-flight, lookahead and admission terms;
+- V2 copy-on-write and dummy contexts are handled;
+- the gate covers runner, connector, HiSparse and context parallelism.
+Kindling's VLLM_GLM5NEXT_DRAFT_POOL_BLOCKS size override is not carried
+over.
+
+Upstream context: vllm-project/vllm#55423 (@zixi-qi, a separate draft
+region in the shared pool, closed in favour of #56983); #56983
+(@Dovis01, DFlash for GLM-5.3-Flash, whose later revision books the
+drafter inside the MLA group); and the generic packed layout of #55219.
+
+Claimed gain (Kindling, DGX Spark TP=4, 26 GiB KV pin, 32 sequences,
+block 2304): 1,416 -> 1,976 target blocks and 2.63M -> 3.67M KV tokens,
+with a 105-block (0.58 GiB) pool. At max_num_seqs 32 and
+max_num_batched_tokens 16384 this version's pool is 618 blocks of 256
+tokens (0.38 GiB), which leaves 1,991 target blocks by the same
+arithmetic. Not yet measured on GB10.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/envs.py                         |  14 ++
+ vllm/v1/core/kv_cache_coordinator.py |  67 ++++++---
+ vllm/v1/core/kv_cache_utils.py       | 202 +++++++++++++++++++++++----
+ vllm/v1/kv_cache_interface.py        |  67 ++++++++-
+ vllm/v1/worker/gpu/input_batch.py    |  15 +-
+ vllm/v1/worker/gpu/model_runner.py   |  12 +-
+ vllm/v1/worker/gpu/warmup.py         |  54 ++++---
+ vllm/v1/worker/utils.py              |   9 +-
+ 8 files changed, 369 insertions(+), 71 deletions(-)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index a82e4099d..60d0cda96 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -256,6 +256,8 @@ if TYPE_CHECKING:
+         | None
+     ) = None
+     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
++    VLLM_GLM5NEXT_DRAFT_POOL: bool = True
++    VLLM_GLM5NEXT_DRAFT_BLOCK_SIZE: int = 0
+     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
+     VLLM_RAISE_ON_LOGIT_NANS: bool = False
+     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
+@@ -1887,6 +1889,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_SSM_CONV_STATE_LAYOUT": env_with_choices(
+         "VLLM_SSM_CONV_STATE_LAYOUT", None, ["SD", "DS"]
+     ),
++    # GLM-5.3-Flash with a sliding-window drafter (e.g. DFlash2): keep the
++    # drafter's KV in its own block pool, sized for max_num_seqs windows,
++    # instead of a page per draft layer in every target block. 0 restores the
++    # shared layout.
++    "VLLM_GLM5NEXT_DRAFT_POOL": lambda: bool(
++        int(os.getenv("VLLM_GLM5NEXT_DRAFT_POOL", "1"))
++    ),
++    # Block size of that pool. 0 picks 256 when it divides the target block
++    # size, else the target block size; a set value must divide it.
++    "VLLM_GLM5NEXT_DRAFT_BLOCK_SIZE": lambda: int(
++        os.getenv("VLLM_GLM5NEXT_DRAFT_BLOCK_SIZE", "0")
++    ),
+     # Enable checking whether the generated logits contain NaNs,
+     # indicating corrupted output. Useful for debugging low level bugs
+     # or bad hardware but it may add compute overhead.
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index daf0cd12c..3ce9e5a2a 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -100,6 +100,19 @@ class KVCacheCoordinator(ABC):
+             enable_kv_cache_events=enable_kv_cache_events,
+             metrics_collector=metrics_collector,
+         )
++        # A sliding-window drafter's groups may draw from a pool of their own
++        # (KVCacheConfig.draft_num_blocks). They opt out of prefix caching, so
++        # the pool is uncached and its new blocks are never zeroed (no Mamba
++        # state shares its pages).
++        self.draft_group_ids = kv_cache_config.draft_pool_group_ids
++        self.draft_block_pool: BlockPool | None = None
++        if self.draft_group_ids:
++            assert kv_cache_config.draft_num_blocks is not None
++            self.draft_block_pool = BlockPool(
++                num_gpu_blocks=kv_cache_config.draft_num_blocks,
++                enable_caching=False,
++                hash_block_size=hash_block_size,
++            )
+ 
+         # KV cache group indices that get the EAGLE last-block drop.
+         self.eagle_group_ids: set[int] = {
+@@ -131,22 +144,27 @@ class KVCacheCoordinator(ABC):
+                 f" (={num_prefill_lookahead})."
+             )
+ 
+-        self.single_type_managers = tuple(
+-            get_manager_for_kv_cache_spec(
+-                kv_cache_spec=kv_cache_group.kv_cache_spec,
+-                max_in_flight_tokens=max_in_flight_tokens,
+-                max_model_len=max_model_len,
+-                block_pool=self.block_pool,
+-                role=kv_cache_group.role,
+-                enable_caching=enable_caching,
+-                kv_cache_group_id=i,
+-                dcp_world_size=dcp_world_size,
+-                pcp_world_size=pcp_world_size,
+-                scheduler_block_size=self.scheduler_block_size,
+-                needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
++        managers = []
++        for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
++            is_draft = i in self.draft_group_ids
++            managers.append(
++                get_manager_for_kv_cache_spec(
++                    kv_cache_spec=kv_cache_group.kv_cache_spec,
++                    max_in_flight_tokens=max_in_flight_tokens,
++                    max_model_len=max_model_len,
++                    block_pool=self.draft_block_pool if is_draft else self.block_pool,
++                    role=kv_cache_group.role,
++                    enable_caching=enable_caching and not is_draft,
++                    kv_cache_group_id=i,
++                    dcp_world_size=dcp_world_size,
++                    pcp_world_size=pcp_world_size,
++                    scheduler_block_size=self.scheduler_block_size,
++                    needs_kv_cache_zeroing=(
++                        self.kv_cache_config.needs_kv_cache_zeroing and not is_draft
++                    ),
++                )
+             )
+-            for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+-        )
++        self.single_type_managers = tuple(managers)
+         # Match Mamba checkpoints to Eagle's attention replay boundary.
+         if use_eagle:
+             for manager in self.single_type_managers:
+@@ -203,10 +221,13 @@ class KVCacheCoordinator(ABC):
+                 state, so it is ignored (0).
+ 
+         Returns:
+-            The number of blocks to allocate.
++            The number of blocks to allocate from the target's pool. Groups in
++            the drafter's own pool are checked against that pool; when it
++            cannot serve them this is more blocks than the target's pool holds.
+ 
+         """
+         num_blocks_to_allocate = 0
++        num_draft_blocks_to_allocate = 0
+         if self.retention_interval != 0:
+             prefill_end = 0
+         for i, manager in enumerate(self.single_type_managers):
+@@ -223,7 +244,7 @@ class KVCacheCoordinator(ABC):
+                     apply_admission_cap=apply_admission_cap,
+                 )
+             else:
+-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
++                num_blocks = manager.get_num_blocks_to_allocate(
+                     request_id,
+                     num_tokens,
+                     new_computed_blocks[i],
+@@ -233,6 +254,18 @@ class KVCacheCoordinator(ABC):
+                     apply_admission_cap=apply_admission_cap,
+                     prefill_end=prefill_end,
+                 )
++                if i in self.draft_group_ids:
++                    num_draft_blocks_to_allocate += num_blocks
++                else:
++                    num_blocks_to_allocate += num_blocks
++        if (
++            self.draft_block_pool is not None
++            and num_draft_blocks_to_allocate
++            > self.draft_block_pool.get_num_free_blocks()
++        ):
++            # Callers compare the count with the target pool's free blocks;
++            # more than it holds fails every such check, as Mamba does.
++            return self.block_pool.num_gpu_blocks + 1
+         return num_blocks_to_allocate
+ 
+     def allocate_new_computed_blocks(
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 2799eb97d..c4e0069fa 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -29,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
+     ChunkedLocalAttentionSpec,
+     CircularBufferSpec,
++    DraftSlidingWindowSpec,
+     FullAttentionSpec,
+     HiddenStateCacheSpec,
+     HiSparseHotSpec,
+@@ -1101,10 +1102,15 @@ def get_max_concurrency_for_kv_cache_config(
+     call sites agree.
+ 
+     Host groups use a separate pool; the smaller concurrency limit applies.
++    Groups in the drafter's own pool are left out: it is sized for
++    ``max_num_seqs`` requests up front (``_glm5_next_draft_pool_blocks``).
+     """
+     num_blocks_per_request = 0
+     host_blocks_per_request = 0
+-    for group in kv_cache_config.kv_cache_groups:
++    draft_pool_group_ids = kv_cache_config.draft_pool_group_ids
++    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
++        if group_id in draft_pool_group_ids:
++            continue
+         required = cdiv(
+             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+             group.kv_cache_spec.page_size_bytes,
+@@ -1251,7 +1257,9 @@ def _get_kv_cache_groups_glm5_next(
+     mla_names = [name for name, spec in mla_specs.items() if spec.tokens_per_state == 1]
+     if not idx_pages or not mla_names:
+         return None
+-    draft_groups = _glm5_next_draft_groups(vllm_config, draft_specs)
++    draft_groups = _glm5_next_draft_groups(
++        vllm_config, draft_specs, mla_specs[mla_names[0]].block_size
++    )
+     if draft_groups is None:
+         return None
+ 
+@@ -1309,6 +1317,7 @@ def _get_kv_cache_groups_glm5_next(
+ def _glm5_next_draft_groups(
+     vllm_config: VllmConfig,
+     draft_specs: dict[str, KVCacheSpec],
++    target_block_size: int,
+ ) -> list[KVCacheGroupSpec] | None:
+     """KV cache groups for a drafter's plain attention layers on the
+     GLM-5.3-Flash layout, or None when they cannot be grouped.
+@@ -1319,6 +1328,10 @@ def _glm5_next_draft_groups(
+     layer-outermost region after the target's slots in
+     ``get_kv_cache_config_from_groups``. Block ids still come from the shared
+     pool, so every pool block also carries one page per draft layer.
++
++    With the drafter's own pool (``_glm5_next_draft_pool_enabled``) its
++    sliding-window layers become ``DraftSlidingWindowSpec`` at
++    ``_glm5_next_draft_block_size``, and their block ids index that pool.
+     """
+     if not draft_specs:
+         return []
+@@ -1333,7 +1346,14 @@ def _glm5_next_draft_groups(
+     buckets: defaultdict[tuple[type, int | None], dict[str, KVCacheSpec]] = (
+         defaultdict(dict)
+     )
++    draft_pool = _glm5_next_draft_pool_enabled(vllm_config)
+     for name, spec in draft_specs.items():
++        if draft_pool and type(spec) is SlidingWindowSpec:
++            spec = replace_as(
++                spec,
++                DraftSlidingWindowSpec,
++                block_size=_glm5_next_draft_block_size(target_block_size),
++            )
+         buckets[(type(spec), getattr(spec, "sliding_window", None))][name] = spec
+     is_eagle_group = spec_config.use_eagle_block_drop()
+     groups: list[KVCacheGroupSpec] = []
+@@ -1349,11 +1369,11 @@ def _glm5_next_draft_groups(
+ 
+ def _is_glm5_next_draft_spec(spec: KVCacheSpec) -> bool:
+     """Plain (GQA/MHA) attention, as drafters attached to GLM-5.3-Flash use."""
+-    return type(spec) in (FullAttentionSpec, SlidingWindowSpec)
++    return type(spec) in (FullAttentionSpec, SlidingWindowSpec, DraftSlidingWindowSpec)
+ 
+ 
+ def _glm5_next_draft_bytes_per_block(draft_groups: list[KVCacheGroupSpec]) -> int:
+-    """Bytes one pool block costs across all draft layers."""
++    """Bytes one block costs across the given groups' draft layers."""
+     return sum(
+         _get_per_layer_spec(group, name).page_size_bytes
+         for group in draft_groups
+@@ -1361,6 +1381,106 @@ def _glm5_next_draft_bytes_per_block(draft_groups: list[KVCacheGroupSpec]) -> in
+     )
+ 
+ 
++def _uses_draft_pool(group: KVCacheGroupSpec) -> bool:
++    """Whether the group's block ids index the drafter's own pool."""
++    return isinstance(
++        next(iter(iter_layer_specs(group.kv_cache_spec))), DraftSlidingWindowSpec
++    )
++
++
++def _glm5_next_draft_pool_enabled(vllm_config: VllmConfig) -> bool:
++    """Whether a sliding-window drafter on GLM-5.3-Flash gets its own pool.
++
++    Sharing the target's pool costs one page per draft layer in every target
++    block, though a sliding-window layer only ever holds its window: with
++    DFlash2 (5 layers) on a 2304-token block, 30% of the KV cache.
++
++    Gated by VLLM_GLM5NEXT_DRAFT_POOL (default on), and only on the path it is
++    wired for: Model Runner V2 (the runner DFlash2 heads run on; it keeps the
++    pool's ids out of KV zeroing, copy-on-write, warmup and dummy contexts),
++    without a KV connector (which would move or defer-free draft blocks),
++    HiSparse or context parallelism. Otherwise the drafter shares the pool.
++    """
++    parallel_config = vllm_config.parallel_config
++    return (
++        envs.VLLM_GLM5NEXT_DRAFT_POOL
++        and vllm_config.kv_transfer_config is None
++        and vllm_config.attention_config.hisparse_config is None
++        and parallel_config.decode_context_parallel_size == 1
++        and parallel_config.prefill_context_parallel_size == 1
++        and vllm_config.use_v2_model_runner
++    )
++
++
++def _glm5_next_draft_block_size(target_block_size: int) -> int:
++    """Block size of the drafter's pool.
++
++    256 by default when it divides the target block, so a request holds its
++    window in about window / 256 pages rather than two whole target blocks;
++    the target block otherwise. It must divide the target block so the
++    scheduler block (lcm over groups) stays the target's.
++    VLLM_GLM5NEXT_DRAFT_BLOCK_SIZE overrides it.
++    """
++    block_size = envs.VLLM_GLM5NEXT_DRAFT_BLOCK_SIZE
++    if not block_size:
++        return 256 if target_block_size % 256 == 0 else target_block_size
++    if block_size % 16 != 0 or target_block_size % block_size != 0:
++        raise ValueError(
++            f"VLLM_GLM5NEXT_DRAFT_BLOCK_SIZE={block_size} must be a multiple of 16 "
++            f"that divides the target block size {target_block_size}"
++        )
++    return block_size
++
++
++def _glm5_next_draft_pool_blocks(
++    vllm_config: VllmConfig, draft_groups: list[KVCacheGroupSpec]
++) -> int | None:
++    """Blocks in the drafter's own pool, or None when there is none.
++
++    Between steps a running request holds a sliding-window group's window,
++    its lookahead and the tokens it has in flight (blocks leave the window on
++    the processed-token basis), plus a block straddling each end; all requests
++    together have at most ``max_in_flight_tokens`` in flight. On top of
++    ``max_num_seqs`` such windows the pool keeps one request's admission
++    reservation (``max_admission_blocks_per_request``) free, so it does not
++    refuse an admission the target's pool would grant, plus the null block.
++    Draft groups share the pool, so their needs add up.
++    """
++    pool_groups = [group for group in draft_groups if _uses_draft_pool(group)]
++    if not pool_groups:
++        return None
++    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
++    max_in_flight_tokens = vllm_config.max_in_flight_tokens
++    num_lookahead_tokens = vllm_config.num_lookahead_tokens
++    num_blocks = 1
++    for group in pool_groups:
++        spec = cast(
++            DraftSlidingWindowSpec, next(iter(iter_layer_specs(group.kv_cache_spec)))
++        )
++        window = spec.sliding_window - 1 + spec.extra_retained_tokens
++        window_blocks = cdiv(window + num_lookahead_tokens, spec.block_size) + 2
++        num_blocks += (
++            max_num_seqs * window_blocks
++            + max_in_flight_tokens // spec.block_size
++            + spec.max_admission_blocks_per_request(
++                max_in_flight_tokens, vllm_config.model_config.max_model_len
++            )
++        )
++    return num_blocks
++
++
++def _glm5_next_draft_pool_bytes(
++    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
++) -> int:
++    """Bytes of the drafter's own pool on this worker, 0 without one."""
++    layout = _glm5_next_tensor_layout(kv_cache_groups)
++    if layout is None:
++        return 0
++    pool_groups = [group for group in layout[8] if _uses_draft_pool(group)]
++    num_blocks = _glm5_next_draft_pool_blocks(vllm_config, pool_groups)
++    return (num_blocks or 0) * _glm5_next_draft_bytes_per_block(pool_groups)
++
++
+ def _glm5_next_tensor_layout(
+     kv_cache_groups: list[KVCacheGroupSpec],
+ ) -> (
+@@ -1692,7 +1812,9 @@ def _get_kv_cache_bytes_per_block(
+         return (
+             len(mla_names) * mla_page
+             + len(idx_names) * idx_page
+-            + _glm5_next_draft_bytes_per_block(draft_groups)
++            + _glm5_next_draft_bytes_per_block(
++                [group for group in draft_groups if not _uses_draft_pool(group)]
++            )
+         )
+ 
+     bytes_per_block = max(
+@@ -1797,25 +1919,41 @@ def get_kv_cache_config_from_groups(
+             draft_groups,
+         ) = glm5_layout
+         target_bytes_per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
++        pool_groups = [group for group in draft_groups if _uses_draft_pool(group)]
++        shared_groups = [group for group in draft_groups if not _uses_draft_pool(group)]
+         bytes_per_block = target_bytes_per_block + _glm5_next_draft_bytes_per_block(
+-            draft_groups
++            shared_groups
++        )
++        # The drafter's own pool is a fixed cost taken before the target's.
++        draft_num_blocks = _glm5_next_draft_pool_blocks(vllm_config, pool_groups)
++        draft_pool_bytes = (draft_num_blocks or 0) * _glm5_next_draft_bytes_per_block(
++            pool_groups
+         )
+         num_blocks = may_override_num_blocks(
+-            vllm_config, available_memory // bytes_per_block
++            vllm_config, max(available_memory - draft_pool_bytes, 0) // bytes_per_block
+         )
+-        size = bytes_per_block * num_blocks
++        size = bytes_per_block * num_blocks + draft_pool_bytes
++        if draft_pool_bytes:
++            logger.info_once(
++                "GLM-5.3-Flash drafter KV: own pool of %d blocks (%s GiB) "
++                "instead of a page per draft layer in each target block",
++                draft_num_blocks,
++                format_gib(draft_pool_bytes),
++            )
+         attn_specs = cast(
+             UniformTypeKVCacheSpecs, attn_group.kv_cache_spec
+         ).kv_cache_specs
+ 
+         kv_cache_tensors: list[KVCacheTensor] = []
+ 
+-        def add_tensor(layer_name: str, spec: KVCacheSpec, offset: int) -> None:
++        def add_tensor(
++            layer_name: str, spec: KVCacheSpec, offset: int, blocks: int = num_blocks
++        ) -> None:
+             kv_cache_tensors.append(
+                 KVCacheTensor(
+                     size=size,
+                     layers=[layer_name],
+-                    layer_stride=spec.page_size_bytes * num_blocks,
++                    layer_stride=spec.page_size_bytes * blocks,
+                     block_stride=spec.page_size_bytes,
+                     offset=offset,
+                 )
+@@ -1843,13 +1981,18 @@ def get_kv_cache_config_from_groups(
+                 add_tensor(tail_name, tail_specs[tail_name], offset)
+ 
+         # Draft layers get unshared layer-outermost regions past the target's
+-        # slots; their groups draw block ids from the same pool.
++        # slots: first those whose groups draw block ids from the target's
++        # pool, then those of the drafter's own pool.
+         offset = target_bytes_per_block * num_blocks
+-        for group in draft_groups:
+-            for draft_name in group.layer_names:
+-                draft_spec = _get_per_layer_spec(group, draft_name)
+-                add_tensor(draft_name, draft_spec, offset)
+-                offset += draft_spec.page_size_bytes * num_blocks
++        for groups, blocks in (
++            (shared_groups, num_blocks),
++            (pool_groups, draft_num_blocks or 0),
++        ):
++            for group in groups:
++                for draft_name in group.layer_names:
++                    draft_spec = _get_per_layer_spec(group, draft_name)
++                    add_tensor(draft_name, draft_spec, offset, blocks)
++                    offset += draft_spec.page_size_bytes * blocks
+ 
+         return KVCacheConfig(
+             num_blocks=num_blocks,
+@@ -1858,6 +2001,7 @@ def get_kv_cache_config_from_groups(
+             prefix_cache_retention_interval=(
+                 vllm_config.cache_config.prefix_cache_retention_interval
+             ),
++            draft_num_blocks=draft_num_blocks,
+         )
+ 
+     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+@@ -2525,6 +2669,10 @@ def generate_scheduler_kv_cache_config(
+         cfg.hisparse_host_num_blocks == kv_cache_configs[0].hisparse_host_num_blocks
+         for cfg in kv_cache_configs
+     )
++    assert all(
++        cfg.draft_num_blocks == kv_cache_configs[0].draft_num_blocks
++        for cfg in kv_cache_configs
++    )
+     # All workers have the same kv_cache_config except layer names, so use
+     # an arbitrary one to initialize the scheduler.
+     cfg = copy.deepcopy(kv_cache_configs[0])
+@@ -2608,19 +2756,21 @@ def _max_memory_usage_bytes_from_groups(
+         )
+         if tail_names:
+             total_blocks += 1
+-        # Draft groups claim their own (window-bounded) block ids, and every
+-        # block id also carries the draft pages.
++        # Draft groups sharing the target's pool claim their own
++        # (window-bounded) block ids, and every block id also carries their
++        # pages; the drafter's own pool is a fixed cost.
++        shared_groups = [group for group in draft_groups if not _uses_draft_pool(group)]
+         total_blocks += sum(
+             cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).max_memory_usage_pages(
+                 vllm_config
+             )
+-            for group in draft_groups
++            for group in shared_groups
+         )
+         return total_blocks * (
+             len(mla_names) * mla_page
+             + len(idx_names) * idx_page
+-            + _glm5_next_draft_bytes_per_block(draft_groups)
+-        )
++            + _glm5_next_draft_bytes_per_block(shared_groups)
++        ) + _glm5_next_draft_pool_bytes(vllm_config, kv_cache_groups)
+ 
+     bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
+     total_blocks = 0
+@@ -2879,12 +3029,13 @@ def get_kv_cache_configs(
+                 adjusted_memory.append(avail_mem)
+                 continue
+             bytes_per_block = _pool_bytes_per_block(groups)
++            draft_pool_bytes = _glm5_next_draft_pool_bytes(vllm_config, groups)
+             logger.info(
+                 "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
+-                avail_mem // bytes_per_block,
++                max(avail_mem - draft_pool_bytes, 0) // bytes_per_block,
+                 override,
+             )
+-            adjusted_memory.append(override * bytes_per_block)
++            adjusted_memory.append(override * bytes_per_block + draft_pool_bytes)
+         available_memory = adjusted_memory
+ 
+     # Reserve the null block BlockPool permanently holds back, so auto-fit and
+@@ -2935,7 +3086,10 @@ def get_kv_cache_configs(
+         # strides and offsets stay consistent with the shrunken allocation.
+         groups = kv_cache_config.kv_cache_groups
+         kv_cache_configs[i] = get_kv_cache_config_from_groups(
+-            vllm_config, groups, min_num_blocks * _pool_bytes_per_block(groups)
++            vllm_config,
++            groups,
++            min_num_blocks * _pool_bytes_per_block(groups)
++            + _glm5_next_draft_pool_bytes(vllm_config, groups),
+         )
+ 
+     for kv_cache_config in kv_cache_configs:
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 3ff0832b1..0464a574f 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -1038,6 +1038,30 @@ class KpoolTailSpec(SlidingWindowSpec):
+         return False
+ 
+ 
++@dataclass(frozen=True, kw_only=True)
++class DraftSlidingWindowSpec(SlidingWindowSpec):
++    """A drafter's sliding-window layer whose blocks come from the drafter's own
++    block pool (``KVCacheConfig.draft_num_blocks``) instead of the target's.
++
++    Like the kpool tail it opts out of prefix caching: the pool is uncached, and
++    the opt-out keeps its (smaller) block size out of the hash-block gcd and the
++    engine's ``cache_config.block_size``. After a prefix-cache hit the drafter's
++    blocks start fresh, so drafts read unwritten context for up to one window;
++    the target verifies every draft, so the output does not change.
++    """
++
++    def is_uniform_with_collection(
++        self, kv_cache_specs: dict[str, KVCacheSpec]
++    ) -> bool:
++        return super().is_uniform_with_collection(kv_cache_specs) and all(
++            isinstance(spec, DraftSlidingWindowSpec) for spec in kv_cache_specs.values()
++        )
++
++    @property
++    def prefix_cacheable(self) -> bool:
++        return False
++
++
+ @dataclass(frozen=True)
+ class MambaSpec(KVCacheSpec):
+     shapes: tuple[tuple[int, ...], ...]
+@@ -1497,6 +1521,37 @@ class KVCacheConfig:
+     kv_tp_replicas: int = 1
+     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
+ 
++    draft_num_blocks: int | None = None
++    """Capacity of the drafter's own block pool, shared by every
++    ``DraftSlidingWindowSpec`` group, when enabled (None: no such pool)."""
++
++    @property
++    def draft_pool_group_ids(self) -> tuple[int, ...]:
++        """IDs of the groups whose block ids index the drafter's pool."""
++        if self.draft_num_blocks is None:
++            return ()
++        return tuple(
++            group_id
++            for group_id, group in enumerate(self.kv_cache_groups)
++            if (specs := iter_layer_specs(group.kv_cache_spec))
++            and all(isinstance(spec, DraftSlidingWindowSpec) for spec in specs)
++        )
++
++    @property
++    def draft_layer_names(self) -> frozenset[str]:
++        """Layers stored in the drafter's pool."""
++        return frozenset(
++            name
++            for group_id in self.draft_pool_group_ids
++            for name in self.kv_cache_groups[group_id].layer_names
++        )
++
++    def num_blocks_of_group(self, group_id: int) -> int:
++        """Number of device blocks the block ids of group ``group_id`` index."""
++        if self.draft_num_blocks is not None and group_id in self.draft_pool_group_ids:
++            return self.draft_num_blocks
++        return self.num_blocks
++
+     @cached_property
+     def transfer_group_ids(self) -> tuple[int, ...]:
+         """IDs of cache groups that participate in external KV transfer."""
+@@ -1560,10 +1615,14 @@ class KVCacheConfig:
+ 
+     def num_blocks_of(self, tensor: KVCacheTensor) -> int:
+         """Number of blocks addressable by the pool backing ``tensor``."""
+-        if not tensor.host_resident:
+-            return self.num_blocks
+-        assert self.hisparse_host_num_blocks is not None
+-        return self.hisparse_host_num_blocks
++        if tensor.host_resident:
++            assert self.hisparse_host_num_blocks is not None
++            return self.hisparse_host_num_blocks
++        if self.draft_num_blocks is not None and tensor.layers[0] in (
++            self.draft_layer_names
++        ):
++            return self.draft_num_blocks
++        return self.num_blocks
+ 
+     @property
+     def has_mamba_layers(self) -> bool:
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index e2f68ad59..1b8c8a308 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -224,11 +224,15 @@ def set_dummy_context(
+     input_batch: InputBatch,
+     block_tables: "BlockTables",
+     context_len: int,
+-    num_kv_blocks: int,
++    num_kv_blocks: int | Sequence[int],
+     max_model_len: int,
+     input_block_tables: Sequence[torch.Tensor] | None = None,
+ ) -> None:
+-    """Give each dummy request context_len of context, used when profiling step cost."""
++    """Give each dummy request context_len of context, used when profiling step cost.
++
++    ``num_kv_blocks`` is the pool size, or one per KV cache group when groups
++    index different pools (the drafter's own pool).
++    """
+     if input_block_tables is None:
+         input_block_tables = block_tables.input_block_tables
+     if not input_block_tables:
+@@ -252,17 +256,20 @@ def set_dummy_context(
+     input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
+ 
+     seq_len = context_len + query_len
+-    for block_table, block_size, bpk in zip(
++    if isinstance(num_kv_blocks, int):
++        num_kv_blocks = [num_kv_blocks] * len(input_block_tables)
++    for block_table, block_size, bpk, group_num_kv_blocks in zip(
+         input_block_tables,
+         block_tables.kernel_block_sizes,
+         block_tables.blocks_per_kv_block,
++        num_kv_blocks,
+     ):
+         num_blocks = min(cdiv(seq_len, block_size), block_table.shape[1])
+         # Spans are disjoint until the pool runs out, then they wrap and share
+         # blocks: profiling only needs the reads to be realistic, not distinct.
+         block_ids = torch.arange(
+             num_reqs * num_blocks, dtype=block_table.dtype, device=block_table.device
+-        ) % (num_kv_blocks * bpk)
++        ) % (group_num_kv_blocks * bpk)
+         block_table[:num_reqs, :num_blocks] = block_ids.view(num_reqs, num_blocks)
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index c2f29972a..97f47d9c6 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -756,8 +756,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 kv_cache_allocation_context=kv_cache_allocation_context,
+                 block_tables=self.block_tables,
+             )
++        # Copy-on-write targets. Layers in the drafter's own pool are left out:
++        # their block ids index that pool, and it never shares prefix blocks.
++        draft_layer_names = self.kv_cache_config.draft_layer_names
+         self.kv_caches = [
+-            cache for cache in kv_caches_dict.values() if cache.device == self.device
++            cache
++            for name, cache in kv_caches_dict.items()
++            if cache.device == self.device and name not in draft_layer_names
+         ]
+         if is_profiling:
+             self.kv_connector = NO_OP_KV_CONNECTOR
+@@ -1821,7 +1826,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         input_batch,
+                         self.block_tables,
+                         context_len,
+-                        self.kv_cache_config.num_blocks,
++                        [
++                            self.kv_cache_config.num_blocks_of_group(i)
++                            for i in range(len(self.kv_cache_config.kv_cache_groups))
++                        ],
+                         self.max_model_len,
+                         input_block_tables=block_tables,
+                     )
+diff --git a/vllm/v1/worker/gpu/warmup.py b/vllm/v1/worker/gpu/warmup.py
+index 56f7d438f..50fb71193 100644
+--- a/vllm/v1/worker/gpu/warmup.py
++++ b/vllm/v1/worker/gpu/warmup.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from collections.abc import Callable
++from collections.abc import Callable, Sequence
+ from contextlib import AbstractContextManager, nullcontext
+ from typing import Any
+ 
+@@ -21,6 +21,7 @@ from vllm.v1.core.sched.output import (
+ from vllm.v1.kv_cache_interface import (
+     CircularBufferSpec,
+     CrossAttentionSpec,
++    KVCacheConfig,
+     KVCacheSpec,
+     MambaSpec,
+     UniformTypeKVCacheSpecs,
+@@ -84,6 +85,33 @@ def _warmup_block_counter(
+     return block_count
+ 
+ 
++def _warmup_block_allocator(
++    kv_cache_config: KVCacheConfig,
++) -> Callable[[Sequence[int]], tuple[list[int], ...]]:
++    """Hand out fresh block ids per KV cache group (0 is the null block).
++
++    Groups in the drafter's own pool count in that pool, wrapping inside it:
++    it is small, and warmup only needs ids it holds.
++    """
++    draft_group_ids = kv_cache_config.draft_pool_group_ids
++    next_block_id = {False: 1, True: 1}
++
++    def alloc(counts: Sequence[int]) -> tuple[list[int], ...]:
++        block_ids: list[list[int]] = []
++        for group_id, num_blocks in enumerate(counts):
++            is_draft = group_id in draft_group_ids
++            start = next_block_id[is_draft]
++            next_block_id[is_draft] = start + num_blocks
++            ids = list(range(start, start + num_blocks))
++            if is_draft:
++                num_draft_blocks = kv_cache_config.num_blocks_of_group(group_id)
++                ids = [1 + (i - 1) % (num_draft_blocks - 1) for i in ids]
++            block_ids.append(ids)
++        return tuple(block_ids)
++
++    return alloc
++
++
+ def run_mixed_prefill_decode_warmup(
+     model_runner: GPUModelRunner,
+     worker_execute_model: Callable[[SchedulerOutput], Any],
+@@ -131,13 +159,7 @@ def run_mixed_prefill_decode_warmup(
+         )
+         return False
+ 
+-    next_block_id = 1
+-
+-    def _alloc_blocks(num_blocks: int) -> list[int]:
+-        nonlocal next_block_id
+-        block_ids = list(range(next_block_id, next_block_id + num_blocks))
+-        next_block_id += num_blocks
+-        return block_ids
++    alloc_blocks = _warmup_block_allocator(model_runner.kv_cache_config)
+ 
+     sampling_params = SamplingParams(max_tokens=2, temperature=0.0)
+ 
+@@ -149,7 +171,7 @@ def run_mixed_prefill_decode_warmup(
+             mm_features=[],
+             sampling_params=sampling_params,
+             pooling_params=None,
+-            block_ids=tuple(_alloc_blocks(n) for n in decode_prefill_block_counts),
++            block_ids=alloc_blocks(decode_prefill_block_counts),
+             num_computed_tokens=0,
+             lora_request=None,
+             prefill_token_ids=decode_token_ids,
+@@ -161,7 +183,7 @@ def run_mixed_prefill_decode_warmup(
+     decode_prefill_output.total_num_scheduled_tokens = decode_prompt_len
+     decode_prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+ 
+-    decode_new_blocks = tuple(_alloc_blocks(n) for n in decode_block_deltas)
++    decode_new_blocks = alloc_blocks(decode_block_deltas)
+     cached_decode_req = CachedRequestData.make_empty()
+     cached_decode_req.req_ids = [decode_req_id]
+     cached_decode_req.num_computed_tokens = [decode_prompt_len]
+@@ -179,7 +201,7 @@ def run_mixed_prefill_decode_warmup(
+             mm_features=[],
+             sampling_params=sampling_params,
+             pooling_params=None,
+-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
++            block_ids=alloc_blocks(prefill_block_counts),
+             num_computed_tokens=0,
+             lora_request=None,
+             prefill_token_ids=prefill_token_ids,
+@@ -317,11 +339,7 @@ def _warmup_kernels(
+         pooling_params = None
+ 
+     # Assign distinct block IDs per request per group. 0 null block, start from 1.
+-    next_block_id = 1
+-
+-    def _alloc_blocks(num_blocks: int) -> list[int]:
+-        nonlocal next_block_id
+-        return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
++    alloc_blocks = _warmup_block_allocator(model_runner.kv_cache_config)
+ 
+     # The KV-block zeroing kernel is driven by the scheduler's
+     # new_block_ids_to_zero, so none of the steps below reach it.
+@@ -338,7 +356,7 @@ def _warmup_kernels(
+                 pooling_params,
+                 mm_features=warmup_mm_features,
+             ),
+-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
++            block_ids=alloc_blocks(prefill_block_counts),
+             prefill_token_ids=prompt_token_ids,
+         )
+         for i in range(num_reqs)
+@@ -394,7 +412,7 @@ def _warmup_kernels(
+                     for spec, held in zip(kv_cache_specs, req_blocks[i])
+                 ]
+                 cached_req_data.new_block_ids.append(
+-                    tuple(_alloc_blocks(n) for n in deltas) if any(deltas) else None
++                    alloc_blocks(deltas) if any(deltas) else None
+                 )
+                 req_blocks[i] = [
+                     held + delta for held, delta in zip(req_blocks[i], deltas)
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index a6ef84bbd..aa3a25a79 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -29,6 +29,7 @@ from vllm.v1.attention.backend import (
+ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
++    DraftSlidingWindowSpec,
+     EncoderOnlyAttentionSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
+@@ -135,7 +136,9 @@ class KVBlockZeroer:
+         Each virtual block is represented as an independent segment so its
+         physical block stride and zeroed page span remain independent.
+ 
+-        Only AttentionSpec layers are processed; Mamba layers are skipped.
++        Only AttentionSpec layers are processed; Mamba layers are skipped, and
++        so are layers in the drafter's own pool, whose block ids are not the
++        scheduler's zeroing ids (and nothing else shares their pages).
+         """
+         self.device = device
+         self._meta: (
+@@ -154,7 +157,9 @@ class KVBlockZeroer:
+ 
+         for group in attn_groups_iter:
+             spec = group.kv_cache_spec
+-            if not isinstance(spec, AttentionSpec):
++            if not isinstance(spec, AttentionSpec) or isinstance(
++                spec, DraftSlidingWindowSpec
++            ):
+                 continue
+             if group.kv_cache_group_id >= len(kernel_block_sizes):
+                 continue

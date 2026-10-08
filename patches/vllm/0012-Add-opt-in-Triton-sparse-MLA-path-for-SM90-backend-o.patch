@@ -1,0 +1,432 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:22:32 -0400
+Subject: [PATCH 12/25] Add opt-in Triton sparse MLA path for SM90 backend on
+ GB10
+
+Source: kindlingai/glm-5.3-flash-gx10 (Kindling) at c748079,
+experimental/fixes/gb10_sparse_mla.py and the VLLM_TRITON_SPARSE_MLA
+branch of experimental/fixes/flashinfer_mla_sparse_sm90.py, by Matt
+Mastracci. The repository carries no LICENSE file; contributed here with
+the owner's permission. The decode split follows Flash-Decoding (Dao et
+al., 2023).
+Upstream status: absent (no vLLM PR).
+
+FlashInfer's FA2 MLA kernel is the only FlashInfer path the SM90 sparse
+backend has on SM12x, and on GB10 it fits only a small KV tile. Add the
+Kindling Triton kernel as an alternative for NoPE MLA: one program per
+query token keeps every head's Q row in registers and streams the
+token's top-k latent rows (FP8 E4M3 or BF16, one tensor-wide scale)
+through tl.dot; small batches split each token's rows across programs
+and combine the partial softmax state.
+
+VLLM_TRITON_SPARSE_MLA=1 sends every forward_mqa row (decode, top-k
+prefill and CUDA-graph replays) through the kernel and skips the
+FlashInfer plan() in the builder, since the kernel reads per-row valid
+counts on device. It is ignored with a warning on rope MLA
+(qk_rope_head_dim != 0). Default off, so FlashInfer stays the default
+for the backend.
+
+The kernel file is Kindling's, reformatted to the vLLM line length and
+importing triton through vllm.triton_utils; its AST is unchanged. The
+other deltas in Kindling's backend copy duplicate the SM12x enablement
+and the fp8 plan dtype already carried in earlier commits.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/envs.py                                  |   8 +
+ .../mla/flashinfer_mla_sparse_sm90.py         |  50 +++-
+ .../attention/backends/mla/gb10_sparse_mla.py | 248 ++++++++++++++++++
+ 3 files changed, 305 insertions(+), 1 deletion(-)
+ create mode 100644 vllm/v1/attention/backends/mla/gb10_sparse_mla.py
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index a89f29747..2f2d393eb 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -174,6 +174,7 @@ if TYPE_CHECKING:
+     VLLM_SERVER_DEV_MODE: bool = False
+     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
+     VLLM_MLA_DISABLE: bool = False
++    VLLM_TRITON_SPARSE_MLA: bool = False
+     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
+     VLLM_RAY_BUNDLE_INDICES: str = ""
+     VLLM_CUDART_SO_PATH: str | None = None
+@@ -1486,6 +1487,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     ),
+     # If set, vLLM will disable the MLA attention optimizations.
+     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
++    # FLASHINFER_MLA_SPARSE_SM90 on NoPE models: run every top-k MQA row
++    # (decode and prefill, including CUDA-graph captured steps) through a
++    # Triton kernel instead of FlashInfer, and skip FlashInfer's plan().
++    # Written for GB10 (SM121), where FlashInfer's FA2 MLA path is slow.
++    "VLLM_TRITON_SPARSE_MLA": lambda: bool(
++        int(os.getenv("VLLM_TRITON_SPARSE_MLA", "0"))
++    ),
+     # If set, vLLM will pick up the provided Flash Attention MLA
+     # Number of GPUs per worker in Ray, if it is set to be a fraction,
+     # it allows ray to schedule multiple actors on a single GPU,
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
+index 1236406bc..1d638df20 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
+@@ -41,8 +41,10 @@ from typing import Any, ClassVar
+ 
+ import torch
+ 
++import vllm.envs as envs
+ from vllm.config import VllmConfig
+ from vllm.config.cache import CacheDType
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention.sparse_mla_attention import (
+     SparseMLACommonImpl,
+ )
+@@ -60,11 +62,14 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+     FlashInferMLASparseMetadata,
+     FlashInferMLASparseMetadataBuilder,
+ )
++from vllm.v1.attention.backends.mla.gb10_sparse_mla import sparse_mla
+ from vllm.v1.attention.backends.mla.sparse_utils import (
+     triton_convert_req_index_to_global_index,
+ )
+ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
+ 
++logger = init_logger(__name__)
++
+ _FP8_KV_DTYPES = ("fp8", "fp8_e4m3")
+ _WORKSPACE_BYTES = 128 * 1024 * 1024
+ # TODO: FlashInfer bakes per-row kv_len into the plan on the host, which
+@@ -458,6 +463,8 @@ class FlashInferMLASparseSM90Builder(FlashInferMLASparseMetadataBuilder):
+             if kv_cache_spec.dtype == torch.uint8
+             else kv_cache_spec.dtype
+         )
++        # VLLM_TRITON_SPARSE_MLA: the Triton kernel needs no FlashInfer plan.
++        self._skip_plan = impl.use_triton_all_rows
+         self.state = _SM90State(
+             device,
+             impl.num_heads,
+@@ -531,6 +538,11 @@ class FlashInferMLASparseSM90Builder(FlashInferMLASparseMetadataBuilder):
+     ) -> FlashInferMLASparseSM90Metadata:
+         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+         assert isinstance(metadata, FlashInferMLASparseSM90Metadata)
++        if self._skip_plan:
++            # Every row runs the Triton kernel, which reads valid counts on
++            # device: no host lengths, no plan, no H2D schedule per step.
++            metadata.state = self.state
++            return metadata
+         # Plan outside any CUDA graph capture; captured runs read the
+         # refreshed buffers.
+         num_rows, kv_lens, exact = self._kv_lens_host(common_attn_metadata)
+@@ -591,6 +603,24 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
+         assert self.topk_indices_buffer is not None
+         self.supports_quant_query_input = False
+         self.use_fp8_kv_cache = self.kv_cache_dtype in _FP8_KV_DTYPES
++        # The Triton kernels read one kv_lora_rank-wide latent row per token
++        # as both K and V, so they only cover NoPE MLA.
++        self._triton_capable = (
++            self.qk_rope_head_dim == 0 and self.head_size == self.kv_lora_rank
++        )
++        self.use_triton_all_rows = False
++        if envs.VLLM_TRITON_SPARSE_MLA:
++            if self._triton_capable:
++                self.use_triton_all_rows = True
++                logger.info_once(
++                    "VLLM_TRITON_SPARSE_MLA=1: every sparse MLA row runs the "
++                    "Triton kernel (gb10_sparse_mla) instead of FlashInfer."
++                )
++            else:
++                logger.warning_once(
++                    "VLLM_TRITON_SPARSE_MLA=1 ignored: the Triton sparse MLA "
++                    "kernel needs NoPE MLA (qk_rope_head_dim=0)."
++                )
+ 
+     def forward_mqa(
+         self,
+@@ -614,7 +644,7 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
+         # return_valid_counts=True keeps the compacted-prefix layout: valid
+         # entries at [0, valid_count), -1 past it — exactly the prefix the
+         # planned per-row lengths address.
+-        topk_slots, _ = triton_convert_req_index_to_global_index(
++        topk_slots, valid_counts = triton_convert_req_index_to_global_index(
+             attn_metadata.req_id_per_token[:num_tokens],
+             attn_metadata.block_table,
+             topk_indices,
+@@ -622,6 +652,24 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
+             NUM_TOPK_TOKENS=topk_indices.shape[1],
+             return_valid_counts=True,
+         )
++        if self.use_triton_all_rows:
++            kv = (
++                kv_c_and_k_pe_cache.view(torch.float8_e4m3fn)
++                if self.use_fp8_kv_cache
++                else kv_c_and_k_pe_cache
++            )
++            kv_scale = (
++                float(layer._k_scale_float or 1.0) if self.use_fp8_kv_cache else 1.0
++            )
++            out = sparse_mla(
++                q_nope,
++                kv.view(-1, self.head_size),
++                topk_slots,
++                valid_counts,
++                self.scale,
++                kv_scale,
++            )
++            return out, None
+         state = attn_metadata.state
+         assert state is not None
+         # Pack valid prefixes at the offsets refreshed by plan() before replay.
+diff --git a/vllm/v1/attention/backends/mla/gb10_sparse_mla.py b/vllm/v1/attention/backends/mla/gb10_sparse_mla.py
+new file mode 100644
+index 000000000..6637aaeff
+--- /dev/null
++++ b/vllm/v1/attention/backends/mla/gb10_sparse_mla.py
+@@ -0,0 +1,248 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#
++# Origin: kindlingai/glm-5.3-flash-gx10 (Kindling),
++# experimental/fixes/gb10_sparse_mla.py at c748079, by Matt Mastracci.
++# Contributed with the owner's permission. The decode split is the
++# Flash-Decoding scheme (Dao et al., 2023).
++"""Sparse NoPE MLA attention for GB10 in Triton: each query token attends to
++its own top-k KV rows (valid prefix of `idx`, -1 past it).
++
++One program per query token: all heads' rows of Q stay in registers, and the
++selected KV rows stream through in blocks, gathered by index. K and V are the
++same latent row (NoPE MLA), FP8 E4M3 with one tensor-wide scale.
++
++Small batches (decode: 1 + drafts tokens per request) leave most of the 48 SMs
++idle with one program per token, so they split each token's rows across
++SPLITS programs, which write partial softmax state that a second kernel
++combines (flash-decoding).
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def _sparse_mla_split(
++    q_ptr,
++    kv_ptr,
++    idx_ptr,
++    len_ptr,
++    acc_ptr,
++    ml_ptr,
++    qk_scale,
++    sq_t,
++    sq_h,
++    H: tl.constexpr,
++    D: tl.constexpr,
++    TOPK: tl.constexpr,
++    CHUNK: tl.constexpr,
++    SPLITS: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    HP: tl.constexpr,
++):
++    t = tl.program_id(0)
++    sp = tl.program_id(1)
++    heads = tl.arange(0, HP)
++    hm = heads < H
++    dims = tl.arange(0, D)
++    q = tl.load(
++        q_ptr + t * sq_t + heads[:, None] * sq_h + dims[None, :],
++        mask=hm[:, None],
++        other=0.0,
++    ).to(tl.float16)
++    n_valid = tl.load(len_ptr + t)
++    m_i = tl.full([HP], float("-inf"), tl.float32)
++    l_i = tl.zeros([HP], tl.float32)
++    acc = tl.zeros([HP, D], tl.float32)
++    for start in range(sp * CHUNK, sp * CHUNK + CHUNK, BLOCK_N):
++        offs = start + tl.arange(0, BLOCK_N)
++        live = offs < n_valid
++        rows = tl.load(idx_ptr + t * TOPK + offs, mask=live, other=0)
++        kv = tl.load(
++            kv_ptr + rows[:, None].to(tl.int64) * D + dims[None, :],
++            mask=live[:, None],
++            other=0.0,
++        )
++        kv = kv.to(tl.float16)
++        s = tl.dot(q, tl.trans(kv)) * qk_scale
++        s = tl.where(live[None, :], s, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp2(m_i - m_new))
++        p = tl.where(m_new[:, None] == float("-inf"), 0.0, tl.exp2(s - m_new[:, None]))
++        l_i = l_i * alpha + tl.sum(p, 1)
++        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), kv)
++        m_i = m_new
++    base = (t * SPLITS + sp) * H
++    tl.store(
++        acc_ptr + (base + heads[:, None]) * D + dims[None, :], acc, mask=hm[:, None]
++    )
++    tl.store(ml_ptr + (base + heads) * 2, m_i, mask=hm)
++    tl.store(ml_ptr + (base + heads) * 2 + 1, l_i, mask=hm)
++
++
++@triton.jit
++def _sparse_mla_combine(
++    acc_ptr,
++    ml_ptr,
++    o_ptr,
++    kv_scale,
++    H: tl.constexpr,
++    D: tl.constexpr,
++    SPLITS: tl.constexpr,
++):
++    t = tl.program_id(0)
++    h = tl.program_id(1)
++    dims = tl.arange(0, D)
++    sps = tl.arange(0, SPLITS)
++    base = (t * SPLITS + sps) * H + h
++    m = tl.load(ml_ptr + base * 2)
++    l = tl.load(ml_ptr + base * 2 + 1)  # noqa: E741
++    m_max = tl.max(m, 0)
++    w = tl.where(m == float("-inf"), 0.0, tl.exp2(m - m_max))
++    l_sum = tl.sum(l * w, 0)
++    acc = tl.load(acc_ptr + base[:, None] * D + dims[None, :])
++    out = tl.sum(acc * w[:, None], 0)
++    out = tl.where(l_sum > 0, out / l_sum, 0.0) * kv_scale
++    tl.store(o_ptr + (t * H + h) * D + dims, out.to(o_ptr.dtype.element_ty))
++
++
++@triton.jit
++def _sparse_mla_fwd(
++    q_ptr,
++    kv_ptr,
++    idx_ptr,
++    len_ptr,
++    o_ptr,
++    qk_scale,
++    kv_scale,
++    sq_t,
++    sq_h,
++    H: tl.constexpr,
++    D: tl.constexpr,
++    TOPK: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    HP: tl.constexpr,
++):
++    t = tl.program_id(0)
++    heads = tl.arange(0, HP)
++    hm = heads < H
++    dims = tl.arange(0, D)
++    q = tl.load(
++        q_ptr + t * sq_t + heads[:, None] * sq_h + dims[None, :],
++        mask=hm[:, None],
++        other=0.0,
++    ).to(tl.float16)
++    n_valid = tl.load(len_ptr + t)
++    m_i = tl.full([HP], float("-inf"), tl.float32)
++    l_i = tl.zeros([HP], tl.float32)
++    acc = tl.zeros([HP, D], tl.float32)
++    for start in range(0, TOPK, BLOCK_N):
++        offs = start + tl.arange(0, BLOCK_N)
++        live = offs < n_valid
++        rows = tl.load(idx_ptr + t * TOPK + offs, mask=live, other=0)
++        kv = tl.load(
++            kv_ptr + rows[:, None].to(tl.int64) * D + dims[None, :],
++            mask=live[:, None],
++            other=0.0,
++        )
++        kv = kv.to(tl.float16)
++        s = tl.dot(q, tl.trans(kv)) * qk_scale  # [H, BLOCK_N], log2 domain
++        s = tl.where(live[None, :], s, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        alpha = tl.exp2(m_i - m_new)
++        p = tl.exp2(s - m_new[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), kv)
++        m_i = m_new
++    # A query with no KV rows gives 0.
++    out = tl.where(l_i[:, None] > 0, acc / l_i[:, None], 0.0) * kv_scale
++    tl.store(
++        o_ptr + t * H * D + heads[:, None] * D + dims[None, :],
++        out.to(o_ptr.dtype.element_ty),
++        mask=hm[:, None],
++    )
++
++
++# Programs a split launch aims for: two per SM on GB10's 48.
++_SPLIT_TARGET = 96
++
++
++def sparse_mla(
++    q,
++    kv,
++    idx,
++    lens,
++    sm_scale,
++    kv_scale=1.0,
++    block_n=32,
++    num_warps=4,
++    num_stages=2,
++    splits=None,
++):
++    """q [T, H, D] bf16 (last dim contiguous), kv [S, D] fp8 e4m3, idx [T, TOPK]
++    int32 global rows with the valid ones first, lens [T] int32 valid counts.
++    Returns [T, H, D] bf16. The 1.44 folds exp into exp2."""
++    T, H, D = q.shape
++    # TP=3: 22 or 24 heads/rank. Tile at the next power of two (>=16 for
++    # tl.dot), masked.
++    hp = max(16, triton.next_power_of_2(H))
++    assert q.stride(2) == 1 and kv.is_contiguous() and idx.stride(1) == 1
++    out = torch.empty(T, H, D, dtype=q.dtype, device=q.device)
++    qk_scale = sm_scale * kv_scale * 1.4426950408889634
++    topk = idx.shape[1]
++    if splits is None:
++        splits = 1
++        while (
++            T * splits < _SPLIT_TARGET
++            and splits < 16
++            and topk % (splits * 2 * block_n) == 0
++        ):
++            splits *= 2
++    if splits > 1:
++        acc = torch.empty(T, splits, H, D, dtype=torch.float32, device=q.device)
++        ml = torch.empty(T, splits, H, 2, dtype=torch.float32, device=q.device)
++        _sparse_mla_split[(T, splits)](
++            q,
++            kv,
++            idx,
++            lens,
++            acc,
++            ml,
++            qk_scale,
++            q.stride(0),
++            q.stride(1),
++            H=H,
++            D=D,
++            TOPK=topk,
++            CHUNK=topk // splits,
++            SPLITS=splits,
++            BLOCK_N=block_n,
++            HP=hp,
++            num_warps=num_warps,
++            num_stages=num_stages,
++        )
++        _sparse_mla_combine[(T, H)](
++            acc, ml, out, kv_scale, H=H, D=D, SPLITS=splits, num_warps=4
++        )
++        return out
++    _sparse_mla_fwd[(T,)](
++        q,
++        kv,
++        idx,
++        lens,
++        out,
++        qk_scale,
++        kv_scale,
++        q.stride(0),
++        q.stride(1),
++        H=H,
++        D=D,
++        TOPK=idx.shape[1],
++        BLOCK_N=block_n,
++        HP=hp,
++        num_warps=num_warps,
++        num_stages=num_stages,
++    )
++    return out

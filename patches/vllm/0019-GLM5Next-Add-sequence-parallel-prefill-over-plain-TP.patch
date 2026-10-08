@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:34:53 -0400
+Subject: [PATCH 19/25] [GLM5Next] Add sequence-parallel prefill over plain TP
+
+GLM-5.3-Flash's mHC widens the residual stream four times, and under
+plain TP every rank runs mHC, the norms and the residual math on every
+token. The model already has an SP path, but only for
+use_sequence_parallel_moe (DP/EP with replicated dense MLPs).
+
+This adds SP for plain TP, chosen per forward from its token count:
+
+- At or above VLLM_GLM53_SP_PREFILL tokens (default 1024), the model
+  shards the residual stream across the TP ranks, so mHC and the norms
+  run on 1/TP of the tokens. Attention and the MLPs all-gather their
+  input and reduce-scatter their partial output; together these move
+  the bytes of the all-reduce they replace.
+- The switch sets the model's is_sequence_parallel, so the existing
+  shard and final gather (and any other gather keyed on it) follow, and
+  flips o_proj/down_proj reduce_results and the MoE runner's
+  skip_final_all_reduce for every layer, only when the state changes.
+- Smaller forwards and CUDA graph captures stay plain TP (SP applied to
+  decode cost 10-15% in the source's measurements).
+- It stays off unless TP > 1 with DP, PP and PCP of 1, the upstream SP
+  path is off and every layer is an mHC layer. It turns itself off if
+  an MoE kernel reduces its own output. VLLM_GLM53_SP_PREFILL=0 turns
+  it off.
+
+The collectives are the stock sp_all_gather/sp_reduce_scatter (custom
+all-gather/reduce-scatter if the communicator has them, else NCCL).
+Results are not bit-identical to plain TP: the reduce-scatter can sum
+the partials in a different order than the all-reduce.
+
+Source: kindlingai/glm-5.3-flash-gx10 @ c748079, the SP hunks of
+  experimental/fixes/model.py (VLLM_GLM_SP_TP, VLLM_GLM_SP_MIN_TOKENS;
+  base vLLM ddd6fbca), by Matt Mastracci; porting authorized by the
+  owner. Not ported: the RDMA (arx/arxbig) collectives, the FP8 and
+  NVFP4 quantized gathers, the fused SP MoE finalize, the L2 prefetch
+  and the TP=3 padding. The module-level SP flag became per-layer state.
+  knapcio's overlay/glm_prefill_shard.py (MIT) shards the same mHC work
+  and was not used.
+Upstream: absent in v0.31.0 and main (only the DP/EP SP-MoE path).
+Claimed gain: Kindling (4x GB10, TP=4, NCCL gathers): +17% prefill.
+  knapcio's mHC prefill shard credits +9-10% cold prefill to the same
+  idea (jnardiello E03).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/glm5next/common/model.py | 69 ++++++++++++++++++++++++++--
+ 1 file changed, 66 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/models/glm5next/common/model.py b/vllm/models/glm5next/common/model.py
+index e064f5063..4a1a2f268 100644
+--- a/vllm/models/glm5next/common/model.py
++++ b/vllm/models/glm5next/common/model.py
+@@ -320,6 +320,8 @@ class Glm5NextDecoderLayer(nn.Module):
+         is_kda_layer = not is_mtp_layer and config.is_kda_layer(layer_idx)
+         self.layer_kind = "kda" if is_kda_layer else "mla"
+         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
++        # Set per forward by Glm5NextModel._sp_prefill (TP-only prefill SP).
++        self.sp_prefill = False
+ 
+         if is_kda_layer:
+             self.self_attn = Glm5NextLinearAttention(
+@@ -546,7 +548,8 @@ class Glm5NextDecoderLayer(nn.Module):
+ 
+         # Attention needs the full token sequence; mHC above ran on the SP
+         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
+-        if self.is_sequence_parallel:
++        sp = self.is_sequence_parallel or self.sp_prefill
++        if sp:
+             x = sp_all_gather(x)[: positions.shape[0]]
+ 
+         x = self.self_attn(
+@@ -554,7 +557,7 @@ class Glm5NextDecoderLayer(nn.Module):
+             positions=positions,
+         )
+ 
+-        if self.is_sequence_parallel:
++        if sp:
+             x = sp_reduce_scatter(x)
+ 
+         # Fuse post-attn hc_post + pre-FFN hc_pre (+ RMSNorm) into one kernel.
+@@ -571,7 +574,11 @@ class Glm5NextDecoderLayer(nn.Module):
+         )
+ 
+         # Fully Connected
+-        if self._mlp_is_moe:
++        if self.sp_prefill:
++            # Plain-TP weights: gather the input, reduce-scatter the partial sum.
++            x = sp_all_gather(x)[: positions.shape[0]]
++            x = sp_reduce_scatter(self.mlp(x))
++        elif self._mlp_is_moe:
+             x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
+         else:
+             x = self.mlp(x)
+@@ -723,12 +730,67 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
+         self.is_sequence_parallel = (
+             vllm_config.parallel_config.use_sequence_parallel_moe
+         )
++        self._init_sp_prefill(vllm_config.parallel_config)
+ 
+         world_size = get_tensor_model_parallel_world_size()
+         assert config.num_attention_heads % world_size == 0, (
+             "num_attention_heads must be divisible by world_size"
+         )
+ 
++    def _init_sp_prefill(self, parallel_config: ParallelConfig) -> None:
++        """Sequence parallelism over plain TP for prefill-sized forwards.
++
++        At or above VLLM_GLM53_SP_PREFILL tokens (default 1024, 0 turns it
++        off), mHC, norms and residuals run on each rank's 1/TP of the tokens;
++        attention and the MLPs all-gather their input and reduce-scatter
++        their partial output, together the bytes of the all-reduce they
++        replace. Smaller forwards, CUDA graph captures included, stay plain TP.
++        Per forward, _sp_prefill sets self.is_sequence_parallel, so every
++        shard and gather the model keys on that flag follows it.
++        """
++        import os
++
++        min_tokens = int(os.environ.get("VLLM_GLM53_SP_PREFILL", "1024"))
++        supported = (
++            parallel_config.tensor_parallel_size > 1
++            and parallel_config.data_parallel_size == 1
++            and parallel_config.pipeline_parallel_size == 1
++            and parallel_config.prefill_context_parallel_size == 1
++            and not self.is_sequence_parallel
++            and all(
++                layer.mhc and not layer.is_mtp_layer for layer in self._active_layers
++            )
++        )
++        self._sp_prefill_min_tokens = min_tokens if supported else 0
++
++    def _sp_prefill(self, num_tokens: int) -> None:
++        """Turn SP on for a prefill-sized forward and off for the rest."""
++        if not self._sp_prefill_min_tokens:
++            return
++        sp = (
++            num_tokens >= self._sp_prefill_min_tokens
++            and not torch.cuda.is_current_stream_capturing()
++        )
++        if sp == self.is_sequence_parallel:
++            return
++        if sp and any(
++            layer._mlp_is_moe and layer.mlp.experts._fused_output_is_reduced
++            for layer in self._active_layers
++        ):
++            # This MoE kernel reduces its own output; it cannot leave a
++            # partial sum to reduce-scatter.
++            self._sp_prefill_min_tokens = 0
++            return
++        self.is_sequence_parallel = sp
++        for layer in self._active_layers:
++            layer.sp_prefill = sp
++            # The layer reduce-scatters these outputs itself under SP.
++            layer.self_attn.o_proj.reduce_results = not sp
++            if layer._mlp_is_moe:
++                layer.mlp.experts.moe_config.skip_final_all_reduce = sp
++            else:
++                layer.mlp.down_proj.reduce_results = not sp
++
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+ 
+@@ -778,6 +840,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
+             comb = None
+ 
+         full_num_tokens = positions.shape[0]
++        self._sp_prefill(full_num_tokens)
+         if self.is_sequence_parallel:
+             hidden_states = sp_shard(hidden_states)
+ 

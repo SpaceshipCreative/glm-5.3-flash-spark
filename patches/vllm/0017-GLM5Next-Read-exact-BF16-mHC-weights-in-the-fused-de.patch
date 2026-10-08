@@ -1,0 +1,377 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:30:39 -0400
+Subject: [PATCH 17/25] [GLM5Next] Read exact BF16 mHC weights in the fused
+ decode kernel
+
+GLM-5.3-Flash keeps its 2 x 45 mHC projections (hc_attn_fn, hc_ffn_fn,
+[24, 4 * hidden]) as FP32 parameters, but the checkpoint stores them in
+BF16. The fused post + pre-norm decode kernel (mhc_fused_tilelang, up
+to 32 tokens) re-reads the whole 1.5 MiB FP32 matrix for every token.
+
+- tilelang_kernels.py: mhc_fused_bf16w_tilelang is the stock kernel with
+  a BF16 weight_t, widened to FP32 in the FMA, plus its launcher.
+  The stock FP32 kernel is unchanged; DeepSeek-V4 keeps using it.
+- tilelang.py: register_mhc_bf16_weights() keeps a BF16 copy of each
+  FP32 weight that BF16 represents exactly, keyed by data_ptr, and
+  mhc_fused_post_pre_tilelang uses the BF16 kernel for those. Before
+  registering anything it runs both kernels on one weight at 1, 3, 16
+  and 32 tokens and registers nothing unless every output matches
+  bit for bit.
+- GLM registers its weights after load_weights and warms the kernel up.
+
+Numerics: widening BF16 to FP32 is exact, and the copies exist only for
+weights whose FP32 values are BF16 values, so each FMA sees the same
+operands in the same order. Sinkhorn and the larger-batch DeepGEMM path
+still read the FP32 weights, so the copies add ~71 MiB per rank.
+VLLM_GLM53_MHC_BF16W=0 turns it off. The copies are keyed by data_ptr
+and refreshed by load_weights, so a reload that changes hc_*_fn in place
+without load_weights would leave them stale.
+
+Source: kindlingai/glm-5.3-flash-gx10 @ c748079,
+  experimental/fixes/tilelang_kernels.py and mhc_tilelang.py (base vLLM
+  ddd6fbca), by Matt Mastracci; porting authorized by the owner. The
+  exactness gate and the bitwise self-check follow
+  knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4 @ 770d115,
+  overlay/glm_mhc_bf16w.py (MIT), re-implemented here. Kindling's
+  VLLM_MHC_FUSED_MAX_TOKENS knob is not ported.
+Upstream: absent in v0.31.0 and main.
+Claimed gain: Kindling (4x GB10, TP=4): 8.2 us per call instead of
+  11.9, ~1% faster decode at one stream, greedy logprobs identical to
+  the FP32 path. knapcio (4x GB10, TP=4): warm kernel 6.7 us at M=4 and
+  16.9 us at M=16 before; part of a decode set worth -1.90 ms per c1
+  step together; bitwise identical at M=1..16.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/model_executor/kernels/mhc/tilelang.py   |  71 ++++++++-
+ .../kernels/mhc/tilelang_kernels.py           | 145 ++++++++++++++++++
+ vllm/models/glm5next/common/model.py          |  37 +++++
+ 3 files changed, 252 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/model_executor/kernels/mhc/tilelang.py b/vllm/model_executor/kernels/mhc/tilelang.py
+index 62741bbda..7976727a9 100644
+--- a/vllm/model_executor/kernels/mhc/tilelang.py
++++ b/vllm/model_executor/kernels/mhc/tilelang.py
+@@ -5,6 +5,65 @@ import torch
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
++# FP32 mHC projection weights (by data_ptr) whose values BF16 holds exactly,
++# mapped to that BF16 copy. The fused decode kernel then reads half the bytes
++# for the same result. Filled by register_mhc_bf16_weights; GLM-5.3 only.
++_MHC_BF16_WEIGHTS: dict[int, torch.Tensor] = {}
++
++
++def register_mhc_bf16_weights(fns: list[torch.Tensor]) -> int:
++    """Give each FP32 ``fn`` that BF16 represents exactly a BF16 copy.
++
++    Call after loading, outside CUDA graph capture. Before any copy is used,
++    the BF16-weight kernel must match the FP32 one bit for bit on the first
++    such weight; otherwise nothing is registered. Returns the number of
++    weights registered.
++    """
++    twins = {}
++    for fn in fns:
++        if not fn.is_cuda or fn.dtype != torch.float32 or not fn.is_contiguous():
++            continue
++        twin = fn.detach().to(torch.bfloat16)
++        if torch.equal(twin.float(), fn):
++            twins[fn.data_ptr()] = (fn, twin)
++    if not twins or not _bf16_weight_kernel_matches(*next(iter(twins.values()))):
++        return 0
++    # ponytail: keyed by data_ptr, so a reload must call this again.
++    _MHC_BF16_WEIGHTS.update({ptr: twin for ptr, (_, twin) in twins.items()})
++    return len(twins)
++
++
++def _bf16_weight_kernel_matches(fn: torch.Tensor, twin: torch.Tensor) -> bool:
++    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
++        _FUSED_POST_PRE_MAX_TOKENS,
++        _MHC_FUSED_BF16W_TILELANG_KERNEL,
++        _MHC_FUSED_TILELANG_KERNEL,
++    )
++
++    mix_size, input_size = fn.shape
++    hc_mult = int((mix_size + 1) ** 0.5) - 1
++    hidden_size = input_size // hc_mult
++    gen = torch.Generator(device=fn.device).manual_seed(0)
++    for m in sorted({1, 3, 16, _FUSED_POST_PRE_MAX_TOKENS}):
++        args = (
++            torch.rand(m, hc_mult, hc_mult, device=fn.device, generator=gen),
++            torch.randn(m, hc_mult, hidden_size, device=fn.device, generator=gen)
++            .to(torch.bfloat16),
++            torch.rand(m, hc_mult, device=fn.device, generator=gen),
++            torch.randn(m, hidden_size, device=fn.device, generator=gen)
++            .to(torch.bfloat16),
++        )
++        shape = (mix_size, hc_mult, hidden_size)
++        ref = _MHC_FUSED_TILELANG_KERNEL(
++            *args, fn.view(shape), hc_mult, hidden_size, mix_size
++        )
++        out = _MHC_FUSED_BF16W_TILELANG_KERNEL(
++            *args, twin.view(shape), hc_mult, hidden_size, mix_size
++        )
++        if not all(torch.equal(a, b) for a, b in zip(ref, out)):
++            return False
++    return True
++
+ 
+ def _torch_hc_prenorm_gemm(
+     x: torch.Tensor,
+@@ -846,6 +905,7 @@ def mhc_fused_post_pre_tilelang(
+ 
+     """
+     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
++        _MHC_FUSED_BF16W_TILELANG_KERNEL,
+         _MHC_FUSED_TILELANG_KERNEL,
+         _MHC_POST_TILELANG_KERNEL,
+         _MHC_PRE_BIG_FUSE_TILELANG_KERNEL,
+@@ -912,7 +972,16 @@ def mhc_fused_post_pre_tilelang(
+     )
+ 
+     if fused_config is not None:
+-        gemm_out_mul, gemm_out_sqrsum, residual_cur = _MHC_FUSED_TILELANG_KERNEL(
++        fused_kernel = _MHC_FUSED_TILELANG_KERNEL
++        fn_bf16 = None
++        # Empty unless GLM-5.3 registered weights. DeepSeek-V4 calls this
++        # function directly, where fn can be a fake tensor with no data_ptr.
++        if _MHC_BF16_WEIGHTS:
++            fn_bf16 = _MHC_BF16_WEIGHTS.get(fn.data_ptr())
++        if fn_bf16 is not None:
++            fused_kernel = _MHC_FUSED_BF16W_TILELANG_KERNEL
++            fn = fn_bf16
++        gemm_out_mul, gemm_out_sqrsum, residual_cur = fused_kernel(
+             comb_res_mix_flat,
+             residual_flat,
+             post_layer_mix_flat,
+diff --git a/vllm/model_executor/kernels/mhc/tilelang_kernels.py b/vllm/model_executor/kernels/mhc/tilelang_kernels.py
+index f7f560f50..a4e9f8700 100644
+--- a/vllm/model_executor/kernels/mhc/tilelang_kernels.py
++++ b/vllm/model_executor/kernels/mhc/tilelang_kernels.py
+@@ -785,6 +785,135 @@ def mhc_fused_tilelang(
+             T.pdl_trigger()
+ 
+ 
++@tilelang_jit
++def mhc_fused_bf16w_tilelang(
++    comb_mix,
++    residual_in,
++    post_mix,
++    x_in,
++    weight_t,
++    yp_out,
++    rp_out,
++    residual_out,
++    hc: int,
++    hidden: int,
++    n_out: int,
++    n_thr: int = 256,
++    h_blk: int = 256,
++    tile_n: int = 1,
++    split_k: int = 1,
++) -> tilelang.JITKernel:
++    """``mhc_fused_tilelang`` reading a BF16 copy of the projection weight.
++
++    Only for weights that BF16 holds exactly: the FP32 widening is exact, so
++    every FMA sees the operands the FP32 kernel would, at half the weight
++    reads. Keep the body in step with ``mhc_fused_tilelang``.
++    """
++    m = T.dynamic("num_tokens")
++    split_k = T.dynamic("split_k")
++    h = hidden
++    h_blk = math.gcd(hidden, h_blk)
++    h_per_split = h // split_k
++    n_tiles = n_out // tile_n
++
++    comb_mix: T.Tensor((m, hc, hc), T.float32)  # type: ignore[no-redef, valid-type]
++    residual_in: T.Tensor((m, hc, h), T.bfloat16)  # type: ignore[no-redef, valid-type]
++    post_mix: T.Tensor((m, hc), T.float32)  # type: ignore[no-redef, valid-type]
++    x_in: T.Tensor((m, h), T.bfloat16)  # type: ignore[no-redef, valid-type]
++    weight_t: T.Tensor((n_out, hc, h), T.bfloat16)  # type: ignore[no-redef, valid-type]
++    yp_out: T.Tensor((split_k, m, n_out), T.float32)  # type: ignore[no-redef, valid-type]
++    rp_out: T.Tensor((split_k, m), T.float32)  # type: ignore[no-redef, valid-type]
++    residual_out: T.Tensor((m, hc, h), T.bfloat16)  # type: ignore[no-redef, valid-type]
++
++    h_iters = h_per_split // n_thr
++    num_warps = n_thr // 32
++
++    with T.Kernel(m, n_tiles, split_k, threads=n_thr) as (i_n, i_nt, i_ks):
++        tid = T.get_thread_binding()
++        warp_id = tid // 32
++        lane = tid % 32
++
++        s_warp = T.alloc_shared((num_warps, tile_n + 1), T.float32)
++        s_post = T.alloc_shared((hc,), T.float32)
++        s_comb = T.alloc_shared((hc, hc), T.float32)
++
++        pm = T.alloc_local((hc,), T.float32)
++        cm = T.alloc_local((hc, hc), T.float32)
++        acc = T.alloc_local((tile_n,), T.float32)
++        sqr = T.alloc_local((1,), T.float32)
++        new_r = T.alloc_local((hc,), T.float32)
++
++        T.clear(acc)
++        T.clear(sqr)
++        h_split_start = i_ks * h_per_split
++
++        if ENABLE_PDL:
++            T.pdl_sync()
++
++        T.copy(post_mix[i_n, 0], s_post)
++        T.copy(comb_mix[i_n, 0, 0], s_comb)
++
++        for j in T.unroll(hc):
++            pm[j] = s_post[j]
++        for j in T.unroll(hc):
++            for k in T.unroll(hc):
++                cm[k, j] = s_comb[k, j]
++
++        # Each thread owns h_iters elements of the k-split's h slice.
++        for it in T.serial(h_iters):
++            h_idx = h_split_start + it * n_thr + tid
++
++            # Compute new residual from layer output and past residual
++            for j in T.unroll(hc):
++                new_r[j] = pm[j] * x_in[i_n, h_idx]
++                for k in T.unroll(hc):
++                    new_r[j] += cm[k, j] * residual_in[i_n, k, h_idx]
++
++            # populate residual_out and compute sqr sum
++            if i_nt == 0:
++                for j in T.unroll(hc):
++                    residual_out[i_n, j, h_idx] = new_r[j]
++                    sqr[0] += new_r[j] * new_r[j]
++
++            # Per-thread FMA into acc[n]
++            for n in T.unroll(tile_n):
++                for j in T.unroll(hc):
++                    acc[n] += (
++                        T.cast(weight_t[i_nt * tile_n + n, j, h_idx], T.float32)
++                        * new_r[j]
++                    )
++
++        for n in T.unroll(tile_n):
++            acc[n] = T.warp_reduce_sum(acc[n])
++        if i_nt == 0:
++            sqr[0] = T.warp_reduce_sum(sqr[0])
++
++        # Cross-warp reduce via shared mem
++        if lane == 0:
++            for n in T.unroll(tile_n):
++                s_warp[warp_id, n] = acc[n]
++            if i_nt == 0:
++                s_warp[warp_id, tile_n] = sqr[0]
++        T.sync_threads()
++
++        # Warp 0 does the final cross-warp sum and writes outputs
++        if warp_id == 0:
++            if lane < tile_n:
++                v = T.alloc_var(T.float32, init=0.0)
++                for w in T.unroll(num_warps):
++                    v += s_warp[w, lane]
++                yp_out[i_ks, i_n, i_nt * tile_n + lane] = v
++
++            if i_nt == 0 and lane == 0:
++                v2 = T.alloc_var(T.float32, init=0.0)
++                for w in T.unroll(num_warps):
++                    v2 += s_warp[w, tile_n]
++                rp_out[i_ks, i_n] = v2
++
++        if ENABLE_PDL:
++            T.pdl_trigger()
++
++
+ @tilelang_jit
+ def mhc_post_tilelang(
+     a,
+@@ -1773,6 +1902,21 @@ class MhcFusedTileLangKernel(
+         )
+ 
+ 
++class MhcFusedBf16wTileLangKernel(MhcFusedTileLangKernel):
++    """MhcFusedTileLangKernel for a BF16 ``weight_t``."""
++
++    @staticmethod
++    def kernel() -> Any:
++        return mhc_fused_bf16w_tilelang
++
++    def warmup_inputs(self, compile_key: MhcFusedTileLangKernel.CompileKey):
++        inputs = super().warmup_inputs(compile_key)
++        inputs["weight_t"] = make_tilelang_warmup_tensor(
++            torch.bfloat16, *inputs["weight_t"].shape
++        )
++        return inputs
++
++
+ class HcHeadFusedTileLangKernel(
+     VllmTileLangJitKernel["HcHeadFusedTileLangKernel.CompileKey"]
+ ):
+@@ -1870,4 +2014,5 @@ _HC_PRENORM_GEMM_TILELANG_KERNEL = HcPrenormGemmTileLangKernel()
+ _MHC_PRE_BIG_FUSE_TILELANG_KERNEL = MhcPreBigFuseTileLangKernel()
+ _MHC_POST_TILELANG_KERNEL = MhcPostTileLangKernel()
+ _MHC_FUSED_TILELANG_KERNEL = MhcFusedTileLangKernel()
++_MHC_FUSED_BF16W_TILELANG_KERNEL = MhcFusedBf16wTileLangKernel()
+ _HC_HEAD_FUSED_TILELANG_KERNEL = HcHeadFusedTileLangKernel()
+diff --git a/vllm/models/glm5next/common/model.py b/vllm/models/glm5next/common/model.py
+index a1100c249..e064f5063 100644
+--- a/vllm/models/glm5next/common/model.py
++++ b/vllm/models/glm5next/common/model.py
+@@ -280,6 +280,18 @@ class Glm5NextMoE(nn.Module):
+         return final_hidden_states.view(num_tokens, hidden_dim)
+ 
+ 
++def _mhc_bf16_weights_enabled() -> bool:
++    """The fused mHC decode kernel may read exact BF16 copies of hc_*_fn.
++
++    The checkpoint stores them in BF16; VLLM_GLM53_MHC_BF16W=0 keeps FP32.
++    """
++    import os
++
++    return current_platform.is_cuda() and os.environ.get(
++        "VLLM_GLM53_MHC_BF16W", "1"
++    ) != "0"
++
++
+ class Glm5NextDecoderLayer(nn.Module):
+     def __init__(
+         self,
+@@ -456,6 +468,16 @@ class Glm5NextDecoderLayer(nn.Module):
+                     hidden_size=self.hidden_size,
+                     hc_mult=self.n,
+                 )
++                if _mhc_bf16_weights_enabled():
++                    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
++                        _MHC_FUSED_BF16W_TILELANG_KERNEL,
++                    )
++
++                    _MHC_FUSED_BF16W_TILELANG_KERNEL.register_warmup(
++                        vllm_config,
++                        hidden_size=self.hidden_size,
++                        hc_mult=self.n,
++                    )
+ 
+     def forward(
+         self,
+@@ -976,6 +998,21 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
+                     )
+                     weight_loader(param, loaded_weight, **kwargs)
+             loaded_params.add(name)
++        if _mhc_bf16_weights_enabled():
++            from vllm.model_executor.kernels.mhc.tilelang import (
++                register_mhc_bf16_weights,
++            )
++
++            fns = [
++                fn
++                for layer in self._active_layers
++                if layer.mhc and not layer.is_mtp_layer
++                for fn in (layer.hc_attn_fn, layer.hc_ffn_fn)
++            ]
++            n = register_mhc_bf16_weights(fns)
++            logger.info_once(
++                "mHC decode kernel reads %d of %d weights in BF16", n, len(fns)
++            )
+         return loaded_params
+ 
+ 

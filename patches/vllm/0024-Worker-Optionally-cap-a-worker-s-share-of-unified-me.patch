@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:42:52 -0400
+Subject: [PATCH 24/25] [Worker] Optionally cap a worker's share of unified
+ memory
+
+vLLM never calls torch.cuda.set_per_process_memory_fraction. Both
+gpu_memory_utilization and --kv-cache-memory-bytes size the KV pool
+only; nothing bounds the allocations outside it, such as GLM-5.3's
+sparse-indexer scores, which grow with chunk size x context / kpool. On
+GB10's unified memory there is no separate VRAM to run out of first: an
+overrun takes host memory until the node stops forking and its watchdog
+resets it, and the OOM killer cannot reclaim a CUDA allocation.
+
+VLLM_GLM53_MEM_FRACTION=<f> caps the worker's torch allocator at that
+fraction of device memory right after the device is set, so an overrun
+becomes torch.OutOfMemoryError: one request fails and the node keeps
+serving. Unset (the default) changes nothing. Allocations that bypass
+the torch allocator (NCCL, cuBLAS/FlashInfer workspaces) are not
+covered.
+
+Source: kindlingai/glm-5.3-flash-gx10 @ c748079,
+  image/patches/worker_memory_cap.py and spark_mem_trace.arm()
+  (TORCH_MEM_FRACTION), by Matt Mastracci; porting authorized by the
+  owner. The memory trace and reporter in spark_mem_trace are not
+  ported.
+Upstream: absent in v0.31.0 and main.
+Claimed gain: stability only. Kindling runs with 0.92 on 4x GB10.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/worker/gpu_worker.py | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 1f34dfef8..d156acb66 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -460,6 +460,14 @@ class Worker(WorkerBase):
+             )
+             self.device = torch.device(f"cuda:{visible_device_index}")
+             torch.accelerator.set_device_index(self.device)
++            # On unified memory (GB10) nothing bounds a worker's allocations
++            # outside the KV pool, and an overrun stalls the host instead of
++            # failing. This caps the torch allocator so it raises an OOM error;
++            # leave room for the weights, the KV pool and a prefill's scratch.
++            if mem_fraction := os.environ.get("VLLM_GLM53_MEM_FRACTION"):
++                torch.cuda.set_per_process_memory_fraction(
++                    float(mem_fraction), self.device
++                )
+ 
+             current_platform.check_if_supports_dtype(self.model_config.dtype)
+ 

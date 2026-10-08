@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:35:30 -0400
+Subject: [PATCH 20/25] [GLM5Next] Compute the indexer head gate from BF16 with
+ FP32 output
+
+The kpool indexer computes its head-gate weights in FP32, because BF16
+rounding can flip near-tie pool rankings at long context. It did so by
+upcasting the hidden states every call and running an FP32 GEMM against
+an FP32 copy of the weight; on GB10 cuBLAS's FP32 small-N kernel took
+~69 us per layer.
+
+Run the GEMM on the BF16 operands with FP32 accumulation and FP32
+output (torch.mm(..., out_dtype=torch.float32)). The output stays FP32
+as before. BF16 x BF16 products are exact in FP32, so the result matches
+the FP32 GEMM up to summation order; it is not bit-identical. The cached
+weight is now a view of the loaded BF16 weight instead of an FP32 copy,
+which also saves that copy's memory.
+
+Source: kindlingai/glm-5.3-flash-gx10 @ c748079,
+  experimental/fixes/attention.py (base vLLM ddd6fbca), by Matt
+  Mastracci; porting authorized by the owner. knapcio's
+  overlay/glm_small_gemv.py (GLM_GATE_GEMV, MIT) targets the same GEMM
+  (66.8 us) with a Triton split-K kernel and was not used.
+Upstream: absent in v0.31.0 and main.
+Claimed gain: Kindling (4x GB10, TP=4): removes ~69 us per indexer
+  layer per step (11 layers). knapcio (4x GB10, TP=4): its gate GEMV
+  is part of -1.25 ms per c1 decode step together with two other
+  changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/glm5next/common/attention.py | 17 ++++++++---------
+ 1 file changed, 8 insertions(+), 9 deletions(-)
+
+diff --git a/vllm/models/glm5next/common/attention.py b/vllm/models/glm5next/common/attention.py
+index f39c3a7cd..99e783f85 100644
+--- a/vllm/models/glm5next/common/attention.py
++++ b/vllm/models/glm5next/common/attention.py
+@@ -285,7 +285,7 @@ class Indexer(nn.Module):
+         self.scale_fmt = "ue8m0"
+         self.quant_block_size = 128  # TODO: get from config
+         self.topk_indices_buffer = topk_indices_buffer
+-        self._wp_fp32: torch.Tensor | None = None
++        self._wp_t: torch.Tensor | None = None
+ 
+         # NOTE: (zyongye) we use fp8 naive cache,
+         #       where we store value in fp8 and scale in fp32
+@@ -337,14 +337,13 @@ class Indexer(nn.Module):
+         # rankings on long-context tasks. Cache it after weights are loaded.
+         kw, _ = self.wk_weights_proj(hidden_states)
+         k = kw[:, : self.head_dim]
+-        if self._wp_fp32 is None:
+-            self._wp_fp32 = (
+-                self.wk_weights_proj.weight.data[self.head_dim :, :]
+-                .t()
+-                .contiguous()
+-                .float()
+-            )
+-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
++        # BF16 inputs with FP32 accumulation and output: the products are exact
++        # in FP32, so this matches an FP32 GEMM up to summation order, without
++        # FP32 copies of the operands (cuBLAS's FP32 small-N GEMM took ~69 us
++        # per layer on GB10).
++        if self._wp_t is None:
++            self._wp_t = self.wk_weights_proj.weight.data[self.head_dim :, :].t()
++        weights = torch.mm(hidden_states, self._wp_t, out_dtype=torch.float32)
+ 
+         k = _fused_indexer_k_norm(
+             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps

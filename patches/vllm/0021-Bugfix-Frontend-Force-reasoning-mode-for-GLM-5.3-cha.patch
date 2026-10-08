@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shijin Zhang <75300765+Dovis01@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:39:11 -0400
+Subject: [PATCH 21/25] [Bugfix][Frontend] Force reasoning mode for GLM-5.3
+ chat templates
+
+GLM-5.3 keeps the GLM-4.x prompt and tool-call format but replaces the
+enable_thinking switch with an always-on "Reasoning Effort:" header, so
+its generation prompt always opens <think>. A request that passes
+enable_thinking=false (or thinking=false) still gets a reasoning block,
+but glm47_moe then stops parsing <think> and the reasoning lands in
+content.
+
+When the tokenizer's chat template is a GLM-5.3 template (GLM prompt and
+tool markup, "Reasoning Effort:", no enable_thinking), ignore the switch
+and keep reasoning extraction on. This also covers serving with a custom
+--chat-template that maps thinking off to a low reasoning effort, as the
+Kindling recipe does: detection reads the checkpoint's template.
+
+Source: vLLM main d95d1dcfb, "[Bugfix][Frontend] Force reasoning mode
+  for GLM-5.3 chat templates in the GLM MoE parser (#56994)", by Shijin
+  Zhang with Chauncey; Apache-2.0. Backported without its tests
+  (tests/reasoning/test_glm4_moe_reasoning_parser.py,
+  test_anthropic_messages_conversion.py), which stay upstream.
+  Supersedes kindlingai/glm-5.3-flash-gx10 @ c748079
+  image/patches/glm53_reasoning_always_parsed.py (Matt Mastracci), which
+  forced reasoning parsing for every template.
+Upstream: merged on main as #56994 (2026-09-29), not in v0.31.0.
+Claimed gain: correctness only; reasoning no longer leaks into content
+  when a client turns thinking off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/parser/glm47_moe.py | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/vllm/parser/glm47_moe.py b/vllm/parser/glm47_moe.py
+index 00e517f2e..9a18228fb 100644
+--- a/vllm/parser/glm47_moe.py
++++ b/vllm/parser/glm47_moe.py
+@@ -20,6 +20,7 @@ import regex as re
+ 
+ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+ from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++from vllm.logger import init_logger
+ from vllm.parser.engine.events import EventType
+ from vllm.parser.engine.parser_engine import ParserEngine
+ from vllm.parser.engine.parser_engine_config import (
+@@ -28,6 +29,8 @@ from vllm.parser.engine.parser_engine_config import (
+     Transition,
+ )
+ 
++logger = init_logger(__name__)
++
+ if TYPE_CHECKING:
+     from vllm.tokenizers import TokenizerLike
+     from vllm.tool_parsers.abstract_tool_parser import Tool
+@@ -77,6 +80,23 @@ def _glm47_arg_converter(raw_args: str, partial: bool) -> str:
+     return json.dumps(params, ensure_ascii=False)
+ 
+ 
++def _glm53_always_thinks(tokenizer: TokenizerLike) -> bool:
++    # GLM-5.3 keeps the GLM-4.x prompt and tool-call format but replaces the
++    # enable_thinking toggle with an always-on "Reasoning Effort:" header, so
++    # its generation prompt always opens <think> and the model output carries
++    # no opening tag.
++    template = getattr(tokenizer, "chat_template", None)
++    return (
++        isinstance(template, str)
++        and "[gMASK]<sop>" in template
++        and "Reasoning Effort:" in template
++        and "enable_thinking" not in template
++        and "<tool_call>" in template
++        and "<arg_key>" in template
++        and "<arg_value>" in template
++    )
++
++
+ @functools.cache
+ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
+     arg_tag_transitions = {
+@@ -192,6 +212,16 @@ class Glm47MoeParser(ParserEngine):
+         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
+         thinking = chat_kwargs.get("thinking", None)
+         enable_thinking = chat_kwargs.get("enable_thinking", None)
++        if (thinking is False or enable_thinking is False) and _glm53_always_thinks(
++            tokenizer
++        ):
++            logger.warning_once(
++                "Ignoring enable_thinking/thinking: the GLM-5.3 chat template "
++                "has no thinking switch, so reasoning is always on and "
++                "disabling extraction would leak it into the content."
++            )
++            thinking = None
++            enable_thinking = None
+         self.thinking_enabled = (
+             True
+             if thinking is None and enable_thinking is None

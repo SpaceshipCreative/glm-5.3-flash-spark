@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:36:04 -0400
+Subject: [PATCH 15/25] Let ModelOpt mixed precision quantize GLM KDA and MLA
+ projections
+
+Source: knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4, overlay/glm5next_kda.py
+and overlay/glm5next_model.py (stop stripping quant_config from KDA and
+MLA), commit 770d115, MIT License, author knapcio. Re-implemented and
+narrowed to ModelOpt MIXED_PRECISION; knapcio's FP8_BLOCK algo and loader
+filter are not ported because v0.31.0 already loads FP8_PB_WO and MXFP8.
+
+Upstream status: not upstream. vLLM main (0f112d180) still builds the
+GLM-5.3-Flash KDA projections and MLA (with its indexer wq_b) with
+quant_config=None.
+
+What/why: the released GLM-5.3-Flash checkpoints keep the KDA, MLA and
+indexer projections in BF16. Glm5NextLinearAttention and the MLA layer
+therefore drop the global quant config, so NVFP4 or FP8 never reach
+them. That also blocks a ModelOpt MIXED_PRECISION checkpoint that stores
+those projections as FP8_PB_WO (128x128 block FP8) or MXFP8.
+Both sites now pass the config through only when it is
+ModelOptMixedPrecisionConfig (the indexer's wq_b inherits MLA's config).
+That config maps every layer missing from quantized_layers to
+UnquantizedLinearMethod, so unlisted projections (kv_b_proj, f_b/g_b,
+wk_weights_proj) stay BF16. Every other config still gets None, so
+existing checkpoints are unaffected. MLAAttention
+gets no KV-cache method from the mixed config (it is not an Attention
+subclass), the same as before.
+
+Claimed gain and config: the lossless8 checkpoint
+(tools/lossless8.py on nvidia/GLM-5.3-Flash-NVFP4) re-encodes 264
+projection groups on their native grids. Per-rank decode weight bytes
+per token drop from 5.23 to 3.52 GiB at TP=4 and from 9.91 to 6.67 GiB
+at TP=2 (header-only model, batch 1). knapcio README (2026-09-28)
+measured step -7.5 ms and 0.25% output error for the same scheme on 4x
+DGX Spark TP=4 with W8A16 Marlin. Serve with --linear-backend marlin.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/glm5next/common/kda.py   | 10 ++++++++--
+ vllm/models/glm5next/common/model.py |  9 ++++++++-
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/models/glm5next/common/kda.py b/vllm/models/glm5next/common/kda.py
+index 436b9685c..cc7b1c693 100644
+--- a/vllm/models/glm5next/common/kda.py
++++ b/vllm/models/glm5next/common/kda.py
+@@ -28,6 +28,9 @@ from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
+     gather_initial_states,
+ )
+ from vllm.model_executor.layers.mamba.ops.scatter_states import scatter_states
++from vllm.model_executor.layers.quantization.modelopt import (
++    ModelOptMixedPrecisionConfig,
++)
+ from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
+ from vllm.model_executor.utils import (
+     maybe_disable_graph_partition,
+@@ -185,10 +188,13 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         vllm_config: VllmConfig,
+         prefix: str = "",
+     ) -> None:
+-        # KDA projections remain BF16 because fp8 checkpoints omit their scales.
++        # KDA projections remain BF16 because fp8 checkpoints omit their scales,
++        # unless a ModelOpt MIXED_PRECISION config lists them in quantized_layers
++        # (unlisted layers stay unquantized there).
+         saved_quant_config = vllm_config.quant_config
+         try:
+-            vllm_config.quant_config = None
++            if not isinstance(saved_quant_config, ModelOptMixedPrecisionConfig):
++                vllm_config.quant_config = None
+             super().__init__(config, vllm_config, prefix)
+         finally:
+             vllm_config.quant_config = saved_quant_config
+diff --git a/vllm/models/glm5next/common/model.py b/vllm/models/glm5next/common/model.py
+index d5274cc7b..66c5a44aa 100644
+--- a/vllm/models/glm5next/common/model.py
++++ b/vllm/models/glm5next/common/model.py
+@@ -42,6 +42,9 @@ from vllm.model_executor.layers.mhc import (
+     hc_expand,
+ )
+ from vllm.model_executor.layers.quantization import QuantizationConfig
++from vllm.model_executor.layers.quantization.modelopt import (
++    ModelOptMixedPrecisionConfig,
++)
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     GroupShape,
+     scaled_dequantize,
+@@ -329,7 +332,11 @@ class Glm5NextDecoderLayer(nn.Module):
+                 kv_lora_rank=config.kv_lora_rank,
+                 max_position_embeddings=config.max_position_embeddings,
+                 cache_config=cache_config,
+-                quant_config=None,  # MLA projections are BF16 in checkpoint
++                # MLA projections are BF16 in released checkpoints; a ModelOpt
++                # MIXED_PRECISION config quantizes only what it lists.
++                quant_config=quant_config
++                if isinstance(quant_config, ModelOptMixedPrecisionConfig)
++                else None,
+                 prefix=f"{prefix}.self_attn",
+                 topk_indices_buffer=topk_indices_buffer,
+                 skip_rope=config.mla_nope,

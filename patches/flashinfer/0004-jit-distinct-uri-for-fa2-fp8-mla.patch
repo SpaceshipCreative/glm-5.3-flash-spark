@@ -1,0 +1,32 @@
+FlashInfer 0.7.0.post1: give FA2 FP8 batch MLA modules their own JIT URI
+
+Source: original to this port (no upstream source).
+License: FlashInfer is Apache-2.0.
+Upstream: not applicable (build-identity guard for the patched header).
+Purpose: JIT module URIs encode only parameters (dtypes, head dims,
+  profiler, plan ABI, _sm90), never source contents. get_aot_artifacts()
+  serves a module from flashinfer/data/aot/ or from a jit-cache provider
+  whose manifest lists the URI before any JIT build runs, and a JIT build
+  directory is reused while ninja sees no newer input. A suffix on the FA2
+  FP8 URI ensures the patched mla.cuh (0003) is what runs: no prebuilt
+  artifact can match it, and a cache shared with an unpatched image
+  cannot be reused. Optional for 0.7.0.post1, whose jit-cache has no FP8
+  MLA module; keep it while 0003 is applied.
+
+--- a/flashinfer/jit/attention/modules.py
++++ b/flashinfer/jit/attention/modules.py
+@@ -223,7 +223,13 @@
+         f"head_dim_ckv_{head_dim_ckv}_"
+         f"head_dim_kpe_{head_dim_kpe}_"
+         f"profiler_{use_profiler}_planabi2"
+-    ) + ("_sm90" if backend == "fa3" else "")
++    ) + ("_sm90" if backend == "fa3" else "") + (
++        # Patched FP8 KV tile cap in mla.cuh: a distinct name so neither a
++        # jit-cache artifact nor an unpatched JIT build is ever reused.
++        "_fp8tilecap"
++        if backend == "fa2" and dtype_kv == torch.float8_e4m3fn
++        else ""
++    )
+ 
+ 
+ def gen_batch_mla_module(

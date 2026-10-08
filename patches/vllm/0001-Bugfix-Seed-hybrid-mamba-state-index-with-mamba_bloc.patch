@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 04:49:09 -0400
+Subject: [PATCH 01/25] [Bugfix] Seed hybrid mamba state index with
+ mamba_block_size on prefix-cache hits (#55601)
+
+Cherry-picked from vllm-project/vllm#55601 (3d6853b32c7c872df00d9e3489f642dc22e974e0)
+by pondzikk <pondzik@gmail.com> (with zjy0516 and ptorsten), Apache-2.0.
+Applied cleanly on v0.31.0. With a DFlash drafter group, cache_config.block_size
+is the drafter's smaller block (1152) while the KDA/Mamba state column must be
+indexed in mamba blocks (2304); on a prefix-cache hit align mode seeded the
+running state index from the wrong block size.
+
+Original trailers:
+Signed-off-by: pondzikk <pondzik@gmail.com>
+Signed-off-by: zjy0516 <riverclouds.zhu@qq.com>
+Co-authored-by: Claude Fable 5.1 <noreply@anthropic.com>
+Co-authored-by: zjy0516 <riverclouds.zhu@qq.com>
+Co-authored-by: ptorsten <1652174+ptorsten@users.noreply.github.com>
+(cherry picked from commit 3d6853b32c7c872df00d9e3489f642dc22e974e0)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/worker/gpu/model_states/mamba_hybrid.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index 32924555b..aff32d5ea 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -114,8 +114,13 @@ class MambaHybridModelState(DefaultModelState):
+         self.num_accepted_tokens_gpu[req_index].fill_(1)
+         if self._align_mode:
+             # Seed the running state block from the resumed/prefilled position.
++            # The column is in mamba blocks. cache_config.block_size is the
++            # min over prefix-cacheable groups, so a drafter group with its own
++            # smaller block (e.g. DFlash) pulls it below mamba_block_size.
++            mamba_block_size = self.cache_config.mamba_block_size
++            assert mamba_block_size is not None
+             self._mamba_state_idx_gpu[req_index].fill_(
+-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
++                (new_req_data.num_computed_tokens - 1) // mamba_block_size
+             )
+ 
+     def _get_mamba_group_info(

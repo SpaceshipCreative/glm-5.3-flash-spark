@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: drakosha <mike@triptrack.net>
+Date: Thu, 8 Oct 2026 05:17:35 -0400
+Subject: [PATCH 11/25] Plan SM90 sparse MLA in fp8 and size the kpool indexer
+ workspace
+
+Source: vllm-project/vllm PR #55222, merge commit c37f86e57 on main
+  ("[Bugfix] GLM-5.3-Flash: fp8 plan dtype on SM90 sparse MLA, and
+  right-size the indexer prefill workspace"), Apache-2.0. Authors:
+  Mikhail Kostryukov (drakosha), NickLucche. vllm/ hunks only; the PR's
+  test changes (tests/v1/attention/test_flashinfer_mla_sparse_sm90.py,
+  test_indexer_deepseek_v4_slot_mapping.py) are left out. Applies to
+  v0.31.0 with offsets only.
+Upstream status: merged to main 2026-09-29, after v0.31.0 was cut; not
+  in any release yet.
+
+1. --kv-cache-dtype fp8 could not start on FLASHINFER_MLA_SPARSE_SM90.
+   An fp8 KV cache is allocated as uint8 storage and run() views it as
+   float8_e4m3fn, but the builder passed kv_cache_spec.dtype (uint8) to
+   plan(), which FlashInfer rejects: "MLA kv_data_type torch.uint8 is not
+   supported". The builder now plans with float8_e4m3fn for a uint8
+   spec. This is the fix Kindling's image/patches/sm90_fp8_kv_dtype.py
+   carried (planned with impl.use_fp8_kv_cache instead of the spec
+   dtype; equivalent for this backend), so that patch is not ported.
+2. GLM-5.3's indexer KV is pool-granular (compress_ratio == index_kpool)
+   but its prefill workspace was sized in tokens, locking about 5 GiB
+   per GPU at max-model-len 1M with index_kpool 4. Indexer and indexer
+   metadata builder now divide get_max_prefill_buffer_size() by the
+   compression ratio.
+
+Needed for the GB10 path: fp8 KV is the point of running the SM90
+backend there.
+
+(cherry picked from commit c37f86e5721f089a27c8e4358c30e435805fcaab)
+
+Signed-off-by: Mikhail Kostryukov <mike@triptrack.net>
+Signed-off-by: NickLucche <nicolo.lucchesi@mistral.ai>
+Co-authored-by: Mikhail Kostryukov <drakosha81@proton.me>
+Co-authored-by: NickLucche <nicolo.lucchesi@mistral.ai>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/glm5next/common/attention.py      |  4 +++-
+ .../mla/flashinfer_mla_sparse_sm90.py         |  8 +++++++-
+ vllm/v1/attention/backends/mla/indexer.py     | 19 ++++++++++---------
+ 3 files changed, 20 insertions(+), 11 deletions(-)
+
+diff --git a/vllm/models/glm5next/common/attention.py b/vllm/models/glm5next/common/attention.py
+index 25f51117a..f39c3a7cd 100644
+--- a/vllm/models/glm5next/common/attention.py
++++ b/vllm/models/glm5next/common/attention.py
+@@ -312,7 +312,9 @@ class Indexer(nn.Module):
+         self.prefix = prefix
+         from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
+ 
+-        self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
++        self.max_total_seq_len = (
++            get_max_prefill_buffer_size(vllm_config) // self.index_kpool
++        )
+         self.indexer_op = SparseAttnIndexerKpool(
+             self.k_cache,
+             self.quant_block_size,
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
+index c8f063fe4..1236406bc 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
+@@ -452,10 +452,16 @@ class FlashInferMLASparseSM90Builder(FlashInferMLASparseMetadataBuilder):
+         assert topk_indices_buffer is not None
+         hf_config = vllm_config.model_config.hf_text_config
+         assert hf_config.index_topk is not None
++        # fp8 KV cache is stored as uint8; plan() needs the logical dtype.
++        kv_plan_dtype = (
++            torch.float8_e4m3fn
++            if kv_cache_spec.dtype == torch.uint8
++            else kv_cache_spec.dtype
++        )
+         self.state = _SM90State(
+             device,
+             impl.num_heads,
+-            kv_cache_spec.dtype,
++            kv_plan_dtype,
+             vllm_config.scheduler_config.max_num_batched_tokens,
+             topk_indices_buffer.shape[1],
+             kv_lora_rank=impl.kv_lora_rank,
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index e7eb67b61..67ce9f353 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -879,8 +879,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+         self.use_pcp = self.pcp_world_size > 1
+         self.pcp_rank = get_pcp_group().rank_in_group if self.use_pcp else 0
+         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
++        # KV compression (DeepseekV4). Default to 1 for no compression.
++        self.compress_ratio = 1
++        if isinstance(self.kv_cache_spec, MLAAttentionSpec):
++            assert isinstance(self.kv_cache_spec.tokens_per_state, int)
++            self.compress_ratio = self.kv_cache_spec.tokens_per_state
+         # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
+-        self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
++        # Counted in compressed rows, like the chunker's seq_lens and the
++        # workspace.
++        self.max_prefill_buffer_size = (
++            get_max_prefill_buffer_size(self.vllm_config) // self.compress_ratio
++        )
+         self.num_speculative_tokens = (
+             self.vllm_config.speculative_config.num_speculative_tokens
+             if self.vllm_config.speculative_config
+@@ -962,14 +971,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+             (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
+         )
+ 
+-        # KV compression. Default to 1 for no compression.
+-        self.compress_ratio = 1
+-        # Get compress_ratio for DeepseekV4 support
+-        if isinstance(self.kv_cache_spec, MLAAttentionSpec):
+-            # MLA compression is a whole number of tokens per state (fractions
+-            # are whisper block pooling and never reach MLA).
+-            assert isinstance(self.kv_cache_spec.tokens_per_state, int)
+-            self.compress_ratio = self.kv_cache_spec.tokens_per_state
+         if self.dcp_world_size > 1 and self.compress_ratio > 1:
+             raise NotImplementedError(
+                 "DCP is not supported with sparse indexer KV compression "

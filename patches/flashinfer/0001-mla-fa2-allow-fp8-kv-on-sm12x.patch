@@ -1,0 +1,34 @@
+FlashInfer 0.7.0.post1: allow FP8 KV for FA2 batch MLA on SM12x
+
+Source: MiaAI-Lab/GLM-5.3-Flash-NVFP4-Dual-DGX-Spark, glm53-flash_SM121.py,
+  bake_fa2_fp8_sm12_gate(), as vendored in kindlingai/glm-5.3-flash-gx10
+  image/patches/ at c748079 and retargeted there (mia_retarget.py) from
+  mla/_core.py to FlashInfer 0.7's mla/_batch_mla/_backends/_fa_common.py.
+License: MIT, Copyright (c) 2026 MiaAI-Lab (full text: ../LICENSE.MiaAI-Lab).
+  FlashInfer is Apache-2.0.
+Upstream: not in flashinfer v0.7.0.post1.
+Purpose: the plan-time validator rejects kv_data_type=float8_e4m3fn on any
+  device but SM90, although the FA2 kernel's FP8 path is portable. vLLM's
+  FLASHINFER_MLA_SPARSE_SM90 backend on GB10 (SM121) plans FA2 with an FP8
+  KV cache. The original accepts major in (9, 12) for both backends; this
+  version accepts SM12x only for fa2, since fa3 is built for sm90a.
+Needs: 0003 on SM12x (the FP8 tile does not fit SM12x shared memory
+  without it).
+
+--- a/flashinfer/mla/_batch_mla/_backends/_fa_common.py
++++ b/flashinfer/mla/_batch_mla/_backends/_fa_common.py
+@@ -90,10 +90,12 @@
+         raise ValueError(f"head_dim_kpe must be >= 0, got {head_dim_kpe}.")
+     if kv_data_type == torch.float8_e4m3fn:
+         major, minor = get_compute_capability(device)
+-        if major != 9:
++        # The FA2 kernel's FP8 path also builds and runs on SM12x (GB10 /
++        # RTX PRO Blackwell); FA3 is still Hopper-only.
++        if major != 9 and not (major == 12 and backend == "fa2"):
+             raise ValueError(
+                 "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
+-                f"got SM{major}{minor}."
++                f"or an SM12x device with the fa2 backend, got SM{major}{minor}."
+             )
+         if q_data_type != torch.bfloat16:
+             raise ValueError(

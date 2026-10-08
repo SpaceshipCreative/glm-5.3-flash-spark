@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:31:41 -0400
+Subject: [PATCH 18/25] [GLM5Next] Write KDA prefill q, k, v as separate dense
+ tensors
+
+GLM-5.3-Flash's KDA prefill runs one merged short conv over q|k|v and
+splits the [T, 3 * P] output into three views with a 3 * P token stride.
+The prefill kernel needs dense q, k and v, so each KDA layer copied three
+[T, P] tensors per chunk (three 56 MB copies per layer at 16k tokens).
+
+causal_conv1d_fn gains an out_group argument: when set, the kernel
+stores features into a [dim // out_group, seqlen, out_group] output, so
+each group comes out as its own dense tensor. KDA passes
+out_group=local_projection_size and unbinds. Only the store address
+changes, so the outputs are bit-identical; other callers keep
+out_group=0 and the old layout.
+
+Source: kindlingai/glm-5.3-flash-gx10 @ c748079,
+  experimental/fixes/causal_conv1d.py and the prefill hunk of
+  experimental/fixes/kda.py (base vLLM ddd6fbca), by Matt Mastracci
+  (also mmastrac/glm-5.3-flash-4x-gx10 PR #4); porting authorized by the
+  owner. knapcio's overlay/glm_kda_conv_split.py (MIT) is an independent
+  wrapper implementation of the same idea and was not used.
+Upstream: absent in v0.31.0 and main. The related strided KDA recurrent
+  inputs (knapcio glm_kda_nocopy) are already in v0.31.0 (1768273c1).
+Claimed gain: Kindling (4x GB10, TP=4): prefill +2-3%. knapcio (4x GB10,
+  TP=4): the copies were 47 ms of a 2554 ms 5760-row prefill chunk
+  (1.8%).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layers/mamba/ops/causal_conv1d.py         | 31 ++++++++++++++++---
+ vllm/models/glm5next/common/kda.py            |  8 +++--
+ 2 files changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/vllm/model_executor/layers/mamba/ops/causal_conv1d.py b/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+index e8254e4f3..35ed761ec 100644
+--- a/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
++++ b/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+@@ -46,6 +46,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
+     stride_cache_indices: tl.constexpr,
+     stride_o_dim: tl.constexpr,
+     stride_o_token: tl.int64,
++    stride_o_group: tl.int64,  # with OUT_GROUP: stride between feature groups
+     stride_block_m: tl.constexpr,  # Stride block to align divided by BLOCK_M
+     # others
+     pad_slot_id: tl.constexpr,
+@@ -57,6 +58,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
+     IS_APC_ENABLED: tl.constexpr,
+     HAS_NULL_BLOCK: tl.constexpr,
+     NP2_STATELEN: tl.constexpr,
++    OUT_GROUP: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     launch_pdl: tl.constexpr,
+@@ -469,10 +471,16 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
+         mask_1d = (idx_token < segment_len) & (
+             idx_feats < dim
+         )  # token-index  # feature-index
++        if OUT_GROUP > 0:
++            o_feats = (idx_feats // OUT_GROUP) * stride_o_group + (
++                idx_feats % OUT_GROUP
++            ) * stride_o_dim
++        else:
++            o_feats = idx_feats * stride_o_dim
+         o_ptrs = (
+             o_ptr
+             + (sequence_start_index + token_offset + idx_token) * stride_o_token
+-            + (idx_feats * stride_o_dim)
++            + o_feats
+         )
+ 
+         tl.store(o_ptrs, acc, mask=mask_1d)
+@@ -496,6 +504,7 @@ def causal_conv1d_fn(
+     block_size_to_align=0,
+     metadata=None,
+     validate_data=False,
++    out_group: int = 0,
+ ):
+     """Support varlen + continuous batching when x is 2D tensor.
+ 
+@@ -546,7 +555,10 @@ def causal_conv1d_fn(
+         The number of tokens already completed for each sequence
+     block_size_to_align: int
+         The block size to align the cached states to
+-    out: same shape as `x`
++    out_group: int
++        If nonzero, return (dim // out_group, seqlen, out_group): each group
++        of out_group features as its own dense tensor. x must be 2D.
++    out: same shape as `x`, unless out_group is set
+     """
+     if isinstance(activation, bool) and activation:
+         activation = "silu"
+@@ -555,7 +567,13 @@ def causal_conv1d_fn(
+     # Store original dtype to cast back at the end
+     original_x_dtype = x.dtype
+     x = x.to(conv_states.dtype)
+-    out = torch.empty_like(x)
++    if out_group:
++        # Output [dim // out_group, seqlen, out_group]: each group of features
++        # (q, k, v of a merged conv) comes out as its own dense tensor.
++        assert x.dim() == 2 and x.shape[0] % out_group == 0
++        out = x.new_empty(x.shape[0] // out_group, x.shape[1], out_group)
++    else:
++        out = torch.empty_like(x)
+     if metadata is not None:
+         nums_dict = metadata.nums_dict
+         args = nums_dict
+@@ -604,7 +622,10 @@ def causal_conv1d_fn(
+         stride_istate_seq = conv_states.stride(0)
+         stride_istate_dim = conv_states.stride(1)
+         stride_istate_token = conv_states.stride(2)
+-    if out.dim() == 2:
++    stride_o_group = 0
++    if out_group:
++        stride_o_group, stride_o_token, stride_o_dim = out.stride()
++    elif out.dim() == 2:
+         stride_o_dim = out.stride(0)
+         stride_o_token = out.stride(1)
+     else:
+@@ -739,6 +760,7 @@ def causal_conv1d_fn(
+         stride_cache_indices,
+         stride_o_dim,
+         stride_o_token,
++        stride_o_group,
+         block_size_to_align // BLOCK_M,
+         # others
+         pad_slot_id,
+@@ -750,6 +772,7 @@ def causal_conv1d_fn(
+         IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
+         HAS_NULL_BLOCK=null_block_id is not None,
+         NP2_STATELEN=np2_statelen,
++        OUT_GROUP=out_group,
+         # launch_cooperative_grid=True
+         BLOCK_M=BLOCK_M,
+         BLOCK_N=256,
+diff --git a/vllm/models/glm5next/common/kda.py b/vllm/models/glm5next/common/kda.py
+index 600b1e1af..03c9d0069 100644
+--- a/vllm/models/glm5next/common/kda.py
++++ b/vllm/models/glm5next/common/kda.py
+@@ -612,7 +612,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         q_ns = k_ns = v_ns = None
+         if attn_metadata_narrowed.num_prefills > 0:
+             assert qkv_ns is not None
+-            qkv_ns = causal_conv1d_fn(
++            # q, k and v come out as separate dense tensors, which FlashKDA
++            # needs; split from one [T, 3 * P] output they had to be copied.
++            q_ns, k_ns, v_ns = causal_conv1d_fn(
+                 qkv_ns.transpose(0, 1),
+                 conv_weights,
+                 conv_bias,
+@@ -622,8 +624,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+                 cache_indices=non_spec_state_indices_tensor,
+                 query_start_loc=non_spec_query_start_loc,
+                 metadata=attn_metadata_narrowed,
+-            ).transpose(0, 1)
+-            q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
++                out_group=self.local_projection_size,
++            ).unbind(0)
+         elif attn_metadata_narrowed.num_decodes > 0:
+             assert non_spec_state_indices_tensor is not None
+             decode_conv_indices = non_spec_state_indices_tensor[

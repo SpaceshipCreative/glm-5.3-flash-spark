@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:14:47 -0400
+Subject: [PATCH 09/25] Run FLASHINFER_MLA_SPARSE_SM90 on SM12x through
+ FlashInfer FA2
+
+Source: MiaAI-Lab/GLM-5.3-Flash-NVFP4-Dual-DGX-Spark,
+  glm53-flash_SM121.py, step bake_sm90_wrapper_for_gb10 (MIT,
+  Copyright (c) 2026 MiaAI-Lab). Taken from the verbatim copy vendored in
+  kindlingai/glm-5.3-flash-gx10 image/patches/ at c748079 (with
+  LICENSE.MiaAI-Lab). Turned from anchor replacements into a diff against
+  v0.31.0; all three anchors matched v0.31.0 exactly once.
+Upstream status: absent. No vLLM PR enables the SM90 sparse-MLA backend
+  on capability 12.
+
+The SM90 sparse-MLA backend wraps FlashInfer's BatchMLAPagedAttention.
+Its FA3 kernel needs Hopper (wgmma), but the FA2 kernel behind the same
+wrapper is portable to sm_12x, and the backend already covers NoPE MLA
+(kpe in {0, 64}). On GB10 this is the only FlashInfer sparse-MLA path
+that keeps a plain fp8_e4m3 KV cache (512 B/token rather than the 656 B
+fp8_ds_mla rows SM120 forces) and dense-MHA prefill, which
+FLASHINFER_MLA_SPARSE_SM120 lacks.
+
+- supports_compute_capability accepts major 12 as well as 9.
+- _SM90State picks backend="fa3" on SM90 and "fa2" elsewhere. FA2 and
+  FA3 share MLAPlan/MLAPlanInfo (include/flashinfer/attention/
+  scheduler.cuh), and the FA2 kernel treats kv_end <= kv_start as an
+  empty work item, so v0.31.0's sync-free plan with the device-side
+  kv_end clamp (#58684) carries over unchanged.
+- The ckv_scale_arr feature gate (FlashInfer >= 0.6.18) applies only to
+  fp8 KV; a bf16 cache does not need it.
+
+FP8 KV on SM12x additionally needs two FlashInfer 0.7.0.post1 fixes
+shipped as separate site-packages patches: the FA2 fp8 gate in
+_fa_common.py (major != 9) and the fp8 CTA_TILE_KV in mla.cuh (32 does
+not fit GB10's ~100 KB smem/SM). bf16 KV runs on stock FlashInfer.
+
+Selection is unchanged by this commit: the backend is reachable on SM12x
+only through --attention-backend FLASHINFER_MLA_SPARSE_SM90.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../mla/flashinfer_mla_sparse_sm90.py         | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
+index a5f7757d3..c8f063fe4 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
+@@ -8,6 +8,10 @@ and FP8 E4M3 KV caches on SM90 with in-kernel dequantization: the FP8 cache
+ is read directly (half the bf16 HBM traffic) and converted to BF16 in shared
+ memory, while queries stay BF16 (no query quantization).
+ 
++On SM12x (GB10 / DGX Spark) the same wrapper runs FlashInfer's portable FA2
++kernel instead of FA3. FP8 KV there needs a FlashInfer whose FA2 MLA path
++accepts SM12x and fits its ~100 KB shared memory per SM.
++
+ Sparsity rides the same trick the FA-based sparse backend uses: with
+ ``page_size=1`` the per-token top-k slot indices ARE the page table, so each
+ query token becomes one varlen batch row whose ``kv_indices`` slice is its
+@@ -176,7 +180,9 @@ class FlashInferMLASparseSM90Backend(AttentionBackend):
+ 
+     @classmethod
+     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+-        return capability.major == 9
++        # SM12x (GB10, RTX 50xx/PRO) runs the portable FA2 kernel; see
++        # _SM90State. FA3 stays Hopper-only.
++        return capability.major in (9, 12)
+ 
+     @classmethod
+     def supports_combination(
+@@ -191,10 +197,10 @@ class FlashInferMLASparseSM90Backend(AttentionBackend):
+         use_mm_prefix: bool,
+         device_capability: DeviceCapability,
+     ) -> str | None:
+-        if not has_flashinfer_sm90_nope_mla():
++        if kv_cache_dtype in _FP8_KV_DTYPES and not has_flashinfer_sm90_nope_mla():
+             return (
+-                "FLASHINFER_MLA_SPARSE_SM90 requires FlashInfer with SM90 "
+-                "MLA support (ckv_scale_arr in "
++                "FLASHINFER_MLA_SPARSE_SM90 fp8 KV requires FlashInfer with "
++                "SM90 MLA support (ckv_scale_arr in "
+                 "BatchMLAPagedAttentionWrapper.run, FlashInfer >= 0.6.18)"
+             )
+         if not use_sparse:
+@@ -271,6 +277,9 @@ class _SM90State:
+             (max_tokens,), topk_width, dtype=torch.int32, device=device
+         )
+         self.kv_indptr = torch.zeros(max_tokens + 1, dtype=torch.int32, device=device)
++        # FA3 (wgmma) is Hopper-only; FA2 is portable to SM12x. Both use the
++        # same MLAPlanInfo layout, so the kv_end clamp below applies to both.
++        backend = "fa3" if torch.cuda.get_device_capability(device)[0] == 9 else "fa2"
+         self.wrapper = BatchMLAPagedAttentionWrapper(
+             self.workspace,
+             qo_indptr=torch.zeros(max_tokens + 1, dtype=torch.int32, device=device),
+@@ -278,7 +287,7 @@ class _SM90State:
+             kv_indices=self.kv_indices,
+             kv_len_arr=self.kv_len_arr,
+             use_cuda_graph=True,
+-            backend="fa3",
++            backend=backend,
+         )
+         self._arange_cpu = torch.arange(self.max_tokens + 1, dtype=torch.int32)
+         self._qo_cpu = torch.empty(self.max_tokens + 1, dtype=torch.int32)

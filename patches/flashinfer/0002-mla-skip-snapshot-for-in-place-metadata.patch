@@ -1,0 +1,34 @@
+FlashInfer 0.7.0.post1: skip the rollback snapshot for in-place MLA metadata
+
+Source: kindlingai/glm-5.3-flash-gx10 (Kindling) at c748079,
+  experimental/fixes/_fa_common.py, by Matt Mastracci (no LICENSE file;
+  used with the owner's permission). The original removed every snapshot;
+  this version skips the snapshot and the copy only for a source that is
+  exactly its reserved target, and keeps the rollback for real copies.
+License: FlashInfer is Apache-2.0.
+Upstream: not in flashinfer v0.7.0.post1.
+Purpose: with use_cuda_graph=True, plan() clones every reserved metadata
+  buffer before copying the new metadata in, so a failed copy can be rolled
+  back. vLLM's SM90 sparse MLA backend fills kv_indices in place and passes
+  the reserved buffer's own prefix, so each plan() cloned and self-copied up
+  to num_tokens x top-k int32 (Kindling measured 136 MB per decode step on
+  GB10). A same-storage copy is the identity, so it needs neither.
+
+--- a/flashinfer/mla/_batch_mla/_backends/_fa_common.py
++++ b/flashinfer/mla/_batch_mla/_backends/_fa_common.py
+@@ -267,6 +267,15 @@
+                 (self._kv_indices_buf[: len(kv_indices)], kv_indices),
+                 (self._kv_len_arr_buf, kv_len_arr),
+             )
++            # A source that is exactly its reserved target (the caller filled
++            # the reserved buffer in place) needs no copy, so no rollback
++            # snapshot either. Cloning it cost a full kv_indices copy per plan
++            # (over 100 MB for sparse MLA at top-k 2048).
++            targets = tuple(
++                (target, source)
++                for target, source in targets
++                if self._storage_interval(target) != self._storage_interval(source)
++            )
+             snapshots = tuple(target.clone() for target, _ in targets)
+             try:
+                 for target, source in targets:

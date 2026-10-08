@@ -1,0 +1,33 @@
+FlashInfer 0.7.0.post1: cap, not force, the FA2 MLA FP8 KV tile at 32
+
+Source: MiaAI-Lab/GLM-5.3-Flash-NVFP4-Dual-DGX-Spark, glm53-flash_SM121.py,
+  bake_fa2_fp8_cta_tile(), as vendored in kindlingai/glm-5.3-flash-gx10
+  image/patches/ at c748079. Same expression, reformatted and commented.
+License: MIT, Copyright (c) 2026 MiaAI-Lab (full text: ../LICENSE.MiaAI-Lab).
+  FlashInfer is Apache-2.0.
+Upstream: not in flashinfer v0.7.0.post1.
+Purpose: DISPATCH_SMEM_CONFIG picks CTA_TILE_KV 16 / 1 stage on devices
+  with 92672..147967 B of shared memory per SM (SM12x, ~100 KB), but the FP8
+  path overrides it to 32, whose shared storage does not fit there. Taking
+  min(CTA_TILE_KV, 32) keeps 32 on Hopper and the 147968 tier (as before)
+  and uses 16 on SM12x.
+Note: this header is compiled by FlashInfer's JIT. The FP8 MLA module is
+  not in flashinfer-jit-cache 0.7.0.post1 (aot.py builds batch MLA only for
+  f16/bf16 KV with head_dim_kpe=64), so it is built from this header on
+  first use. 0004 makes that independent of any cache.
+
+--- a/flashinfer/data/include/flashinfer/attention/mla.cuh
++++ b/flashinfer/data/include/flashinfer/attention/mla.cuh
+@@ -1259,7 +1259,11 @@
+ 
+   DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, {
+     constexpr uint32_t EFF_NUM_STAGES = NUM_STAGES;
+-    constexpr uint32_t EFF_CTA_TILE_KV = std::is_same_v<DTypeKV, __nv_fp8_e4m3> ? 32 : CTA_TILE_KV;
++    // FP8 caps the KV tile at 32 instead of forcing it: below 147968 B of smem
++    // per SM (SM12x, ~100 KB) the 32-wide FP8 tile does not fit.
++    constexpr uint32_t EFF_CTA_TILE_KV = std::is_same_v<DTypeKV, __nv_fp8_e4m3>
++                                             ? (CTA_TILE_KV < 32 ? CTA_TILE_KV : 32)
++                                             : CTA_TILE_KV;
+     constexpr bool EFF_QK_SHARD = std::is_same_v<DTypeKV, __nv_fp8_e4m3> ? false : QK_SHARD;
+     using KTraits =
+         KernelTraits<CAUSAL, EFF_NUM_STAGES, EFF_QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,

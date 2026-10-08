@@ -1,0 +1,44 @@
+glm-5.3-flash-spark
+Copyright 2026 SpaceshipCreative and glm-5.3-flash-spark contributors
+Licensed under the Apache License, Version 2.0 (LICENSE).
+
+This repository contains patches to, and code derived from, the projects below.
+Each patch's commit message names its exact source, commit and license.
+
+vLLM (https://github.com/vllm-project/vllm), Apache-2.0
+  patches/vllm/* are diffs against vLLM v0.31.0 and include backports of vLLM
+  pull requests #55601, #54076, #50843, #52814, #56983, #55423, #55222, #56994.
+
+FlashInfer (https://github.com/flashinfer-ai/flashinfer), Apache-2.0
+  patches/flashinfer/* are diffs against flashinfer-python 0.7.0.post1.
+
+MiaAI-Lab, MIT (LICENSES/MIT-MiaAI-Lab.txt), Copyright (c) 2026 MiaAI-Lab
+  sm_121 changes from GLM-5.3-Flash-NVFP4-Dual-DGX-Spark (glm53-flash_SM121.py):
+  the SM90 sparse-MLA backend on capability 12, the FlashInfer FA2 FP8 gate and
+  FP8 tile cap, PDL off on SM12x, and the kpool indexer -1 initialization and
+  bounds check.
+
+knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4, MIT (LICENSES/MIT-knapcio.txt),
+Copyright (c) 2026 knapcio
+  The Triton sparse-MLA prefill kernel, the lossless8 grid rules in
+  tools/lossless8.py (from scripts/glm_quant_mix.py), the lossless8 loader
+  patches (overlay/qmix_patch.py, overlay/glm5next_kda.py), the tool-markup
+  parser fix and the prefill-interval change.
+
+kindlingai/glm-5.3-flash-gx10 (https://github.com/kindlingai/glm-5.3-flash-gx10)
+  RecoverSSM for GLM-5.3-Flash, sequence-parallel prefill, mHC BF16 weight
+  reads, KDA causal_conv1d out_group, the indexer head gate, the opt-in Triton
+  sparse-MLA path, the worker memory cap, the separate drafter KV pool and the
+  FlashInfer plan() finding. The files these come from are modified
+  vLLM/FlashInfer files that keep their Apache-2.0 headers, except
+  gb10_sparse_mla.py (Triton sparse MLA, opt-in), which carries no license
+  header; per-file origins are in that repository's experimental/README.md.
+
+Z.ai GLM-5.3-Flash chat template, MIT (LICENSES/MIT-zai-GLM-5.3-Flash.txt),
+Copyright (c) 2026 Z.AI Co., Ltd
+  chat-template.jinja is zai-org/GLM-5.3-Flash chat_template.jinja at eb9eb208
+  with one change (thinking off maps to low reasoning effort), a finding of
+  kindlingai/glm-5.3-flash-gx10.
+
+Model weights are not included. GLM-5.3-Flash (Z.ai) and nvidia/GLM-5.3-Flash-NVFP4
+are MIT; incoai/GLM-5.3-Flash-DFlash2 is CC BY-NC-ND 4.0.

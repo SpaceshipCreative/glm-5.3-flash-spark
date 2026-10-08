@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:04:37 -0400
+Subject: [PATCH 04/25] [Bugfix] Bound tile-local argmax to vocab_size in
+ samplers
+
+The Gumbel sampler and the rejection sampler reduce over a BLOCK_SIZE-wide
+tile of the logits row and form the token id as
+`block_idx * BLOCK_SIZE + idx`. Out-of-vocab tail lanes of the last tile
+are loaded as -inf, so when the in-vocab lanes are all non-finite the
+reduction can settle on a tail lane and emit token_id >= vocab_size.
+Clamp the tile-local argmax at all three sites (_gumbel_sample_kernel,
+_compute_local_logits_stats_kernel, _resample_kernel); an in-vocab
+argmax is unchanged. GLM-5.3-Flash pads its vocabulary, so an
+out-of-range draft/target id would otherwise reach the embedding or the
+DFlash drafter.
+
+Ported from open PR vllm-project/vllm#50843 (head 3737f51f9) by Alex
+Bilichenko <abilichenko@gmail.com>, Apache-2.0. The same three
+`tl.minimum` edits are in knapcio's GLM-5.3-Flash-4x-DGX-Spark-TP4
+overlay (gumbel.py, rejection_sampler_utils.py; Apache-2.0 overlay).
+
+Conflict resolution for v0.31.0: _resample_kernel now branches on
+WATERMARK (philox_gumbel_block_argmax / _seeded_resample_argmax) where the
+PR's base called gumbel_block_argmax directly. Kept the v0.31.0 branches
+and applied the clamp to the shared token_id line after them, so the
+watermarked draw is bounded too. Tests (CUDA-only) from the PR:
+tests/v1/spec_decode/test_rejection_sampler_utils.py,
+tests/v1/worker/test_gpu_gumbel_sample.py.
+
+Signed-off-by: Alex Bilichenko <abilichenko@gmail.com>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/worker/gpu/sample/gumbel.py                   |  7 ++++++-
+ .../worker/gpu/spec_decode/rejection_sampler_utils.py | 11 +++++++++--
+ 2 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/sample/gumbel.py b/vllm/v1/worker/gpu/sample/gumbel.py
+index e54a45870..dbb63bc83 100644
+--- a/vllm/v1/worker/gpu/sample/gumbel.py
++++ b/vllm/v1/worker/gpu/sample/gumbel.py
+@@ -318,7 +318,12 @@ def _gumbel_sample_kernel(
+         USE_FP64=USE_FP64,
+         PER_TOKEN_COL=PER_TOKEN_COL,
+     )
+-    token_id = block_idx * BLOCK_SIZE + idx
++    # `idx` is the argmax over a BLOCK_SIZE-wide tile whose out-of-vocab tail
++    # lanes are loaded as -inf. If the in-vocab lanes are all non-finite, the
++    # reduction can settle on a tail lane and yield token_id >= vocab_size.
++    # Clamp to provide an addressable in-vocabulary fallback. This does not
++    # define a semantically correct token or fix the source of non-finite logits.
++    token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
+     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
+     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index cf804e6a6..fed770ae2 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -247,7 +247,12 @@ def _compute_local_logits_stats_kernel(
+             other=float("-inf"),
+         ).to(tl.float32)
+         value, idx = tl.max(target_logits, axis=0, return_indices=True)
+-        token_id = block_idx * BLOCK_SIZE + idx
++        # Out-of-vocab tail lanes are loaded as -inf. If the in-vocab lanes are
++        # all non-finite, the reduction can settle on a tail lane and yield
++        # token_id >= vocab_size. Clamp to provide an addressable in-vocabulary
++        # fallback; this neither chooses a semantically correct token nor fixes
++        # the source of non-finite logits.
++        token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
+         tl.store(
+             target_local_argmax_ptr
+             + logit_idx * target_local_argmax_stride
+@@ -915,7 +920,9 @@ def _resample_kernel(
+             vocab_size,
+             USE_FP64=USE_FP64,
+         )
+-    token_id = block_idx * BLOCK_SIZE + idx
++    # Preserve the bounded-fallback contract from
++    # _compute_local_logits_stats_kernel for the resampling path.
++    token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
+     tl.store(
+         resampled_local_argmax_ptr
+         + req_idx * resampled_local_argmax_stride

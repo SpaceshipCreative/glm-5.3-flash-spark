@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:03:40 -0400
+Subject: [PATCH 03/25] [Platform][CUDA] Disable PDL on SM12x (GB10)
+
+CudaPlatformBase.is_arch_support_pdl() returned `major >= 9`, so GB10
+(compute capability 12.1) launched the mamba/KDA state Triton kernels
+(causal_conv1d, gather_initial_states, scatter_states) and the mHC
+TileLang kernels with programmatic dependent launch. On GB10 this races
+in the KDA state and mHC kernels for GLM-5.3-Flash. Return False for
+major == 12; Hopper (9), datacenter Blackwell (10) and SM11x keep PDL.
+
+All PDL users in the tree read this predicate (the mHC kernels cache it
+at import), so no other call sites change. vLLM has no general PDL
+env-var override (only the LoRA-specific VLLM_LORA_DISABLE_PDL), so none
+is added.
+
+From MiaAI-Lab glm53-flash_SM121.py, bake_pdl_off_sm12 (MIT,
+Copyright (c) 2026 MiaAI-Lab); same idea, narrowed to exclude only
+major 12 (MiaAI's version returns `major in (9, 10)`).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/platforms/cuda.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/platforms/cuda.py b/vllm/platforms/cuda.py
+index 68c3aa785..ba333d53f 100644
+--- a/vllm/platforms/cuda.py
++++ b/vllm/platforms/cuda.py
+@@ -758,7 +758,9 @@ class CudaPlatformBase(Platform):
+             major, _ = torch.cuda.get_device_capability(device)
+         except Exception:
+             return False
+-        return major >= 9
++        # PDL is unvalidated on SM12x (GB10, RTX 50xx) and races in the KDA
++        # state and mHC kernels on GB10, so keep it off there.
++        return major >= 9 and major != 12
+ 
+ 
+ # NVML utils

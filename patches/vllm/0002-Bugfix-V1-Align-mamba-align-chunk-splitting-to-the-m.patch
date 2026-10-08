@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 04:51:34 -0400
+Subject: [PATCH 02/25] [Bugfix][V1] Align mamba "align" chunk splitting to the
+ mamba group block size
+
+Ported from open PR vllm-project/vllm#54076 (head b3fcf7c22, 4 commits:
+15bacb84d, a1aa75419, 8f733ddf7, b3fcf7c22) by wickist
+<261605936+wickist@users.noreply.github.com>, Apache-2.0. Applied to v0.31.0
+with `git cherry-pick -n` and no conflicts; squashed into one commit.
+
+What it does:
+- Scheduler._mamba_block_aligned_split stops on MambaSpec.block_size
+  (`self.mamba_state_block_size`, derived once from the mamba groups),
+  instead of cache_config.block_size, which is the minimum over all groups.
+  For GLM-5.3-Flash with DFlash2, cache_config.block_size is the drafter's
+  1152 while a KDA state slot covers 2304; chunks ending on an odd multiple
+  of 1152 left slot i holding S(end) under the hash for end + 1152, so a warm
+  prefix hit resumed the recurrent state half a block early.
+- Every crossed mamba block boundary ends a chunk (except in internal
+  prefill-checkpoint mode), so interior state slots are not left null.
+  Note: this caps non-final align-mode prefill chunks at one mamba block
+  (2304 tokens) per request per step.
+- use_eagle_block_drop() is scoped to eagle/eagle3/mtp
+  (new use_eagle_preserves_target_kv_cache()); DFlash/DSpark draft from
+  their own KV cache, so the last block-aligned state is no longer backed off
+  one block. This also covers knapcio's "materialize the last full block"
+  stop (GLM-5.3-Flash-4x-DGX-Spark-TP4 overlay/glm_mamba_align_fix.py).
+
+Tests from the PR: tests/v1/core/test_mamba_align_chunk_split.py,
+tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py,
+tests/v1/core/test_prefix_caching.py, tests/test_config.py.
+
+Conflict resolution for v0.31.0 (tests only, no source conflicts):
+- The PR's new hetero split stub sets `mamba_shared_prefix_checkpoint=False`
+  (the v0.31.0 name of upstream's `mamba_fine_grained_prefix_cache`).
+- Stubs the PR does not touch gain `mamba_state_block_size`:
+  test_partial_prefix_cache_hits.py::test_mamba_align_split_stops_below_eagle_proof_boundary
+  and test_mamba_eagle_resume_checkpoint.py::_stub.
+- test_mamba_eagle_resume_checkpoint.py: two junction-stop probes that
+  assumed a chunk from 0 may span blocks now start one block below the
+  junction, so they still check the same chunk end (2048, 992, 1536).
+
+Signed-off-by: wickist <261605936+wickist@users.noreply.github.com>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/config/speculative.py      | 19 +++++++++++--
+ vllm/v1/core/sched/scheduler.py | 48 ++++++++++++++++++++++++++++-----
+ 2 files changed, 59 insertions(+), 8 deletions(-)
+
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index dbec9fd74..9e51cf57e 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1942,8 +1942,23 @@ class SpeculativeConfig:
+         return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+ 
+     def use_eagle_block_drop(self) -> bool:
+-        """Whether volatile trailing cache blocks should be discarded."""
+-        return self.use_eagle() and not self.disable_eagle_block_drop
++        """Whether volatile trailing cache blocks should be discarded.
++
++        Only eagle-family drafters share (and pollute via lookahead KV write)
++        the target's full-attention KV cache groups; DFlash/DSpark draft from
++        their own KV cache and never write target blocks (#53477), so the
++        drop applies to eagle/eagle3/mtp only, unless explicitly disabled.
++        """
++        return (
++            self.use_eagle_preserves_target_kv_cache()
++            and not self.disable_eagle_block_drop
++        )
++
++    def use_eagle_preserves_target_kv_cache(self) -> bool:
++        # Only eagle-family drafters share (and pollute via lookahead KV
++        # write) the target's full-attention KV cache groups; DFlash/DSpark
++        # draft from their own KV cache and never write target blocks.
++        return self.method in ("eagle", "eagle3", "mtp")
+ 
+     def use_dflash(self) -> bool:
+         return self.method == "dflash"
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 8b188de13..8c896aa29 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -385,6 +385,29 @@ class Scheduler(SchedulerInterface):
+             self.mamba_partial_cache_hit
+             and self.kv_cache_manager.mamba_shared_prefix_checkpoint
+         )
++        # The mamba "align" state grid is the mamba group's own block size.
++        # `cache_config.block_size` is the minimum over all groups and can be
++        # finer than the state grid in heterogeneous layouts (page-size
++        # matching, a drafter or attention group with a smaller block, or an
++        # explicit --block-size; see also #53142 for the worker-side sibling
++        # of this invariant). The worker checkpoints a state only where a
++        # chunk ENDS exactly on `MambaSpec.block_size` (`postprocess_mamba`),
++        # so `_mamba_block_aligned_split` must stop on that grid: on a finer
++        # generic grid the stops never coincide with it below the scheduler
++        # LCM, no state materializes, and the mamba group publishes no (or a
++        # misaligned) prefix hash.
++        mamba_state_block_sizes = {
++            group.kv_cache_spec.block_size
++            for group in kv_cache_config.kv_cache_groups
++            if isinstance(group.kv_cache_spec, MambaSpec)
++        }
++        assert len(mamba_state_block_sizes) <= 1, (
++            "mamba align scheduling requires a single mamba state block size, "
++            f"got {sorted(mamba_state_block_sizes)}"
++        )
++        self.mamba_state_block_size = (
++            next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
++        )
+ 
+         # Counts of non-empty steps scheduled / processed. update_from_output
+         # is called once per scheduled step in FIFO order, so these stay in sync.
+@@ -437,7 +460,14 @@ class Scheduler(SchedulerInterface):
+         if start >= prefill_end:
+             return num_new_tokens
+ 
+-        block_size = self.cache_config.block_size
++        # Chunk ends are what the worker checkpoints a mamba state at, so the
++        # stops follow the mamba group's own grid, not the generic group
++        # minimum (see `mamba_state_block_size` in `__init__`).
++        block_size = (
++            self.mamba_state_block_size
++            if self.mamba_state_block_size is not None
++            else self.cache_config.block_size
++        )
+         # The last block-aligned position whose state can be cached. With
+         # Eagle, FullAttn prunes the last matching block, so back off one
+         # block to avoid a Mamba cache miss.
+@@ -506,11 +536,17 @@ class Scheduler(SchedulerInterface):
+             else block_floored
+         )
+         stops = (
+-            # Same invariant: a chunk starting mid-block stops at the boundary
+-            # rather than running past it.
+-            next_block_boundary
+-            if start % block_size != 0 and not use_internal_checkpoint
+-            else 0,
++            # Every crossed block boundary must end a chunk: the allocator
++            # hands out one mamba state column per step, so a chunk spanning
++            # k blocks leaves the k-1 interior state slots permanently null
++            # (a later prefix lookup asking for exactly those boundaries
++            # misses, or worse, a positional hash publishes a truncated
++            # state). Stop unconditionally even when the start is aligned —
++            # reachable whenever the token budget exceeds one block. Exempt:
++            # internal checkpointing (#53614) materializes the interior
++            # states itself and only applies to a chunk that reaches the
++            # checkpoint position, so chunks in that mode may span blocks.
++            0 if use_internal_checkpoint else next_block_boundary,
+             # Never run past the last cacheable block boundary mid-chunk.
+             last_cache_position,
+             # Fine-grained hits: the prompt's partial-tail entry can only be

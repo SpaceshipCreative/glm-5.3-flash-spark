@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:39:47 -0400
+Subject: [PATCH 22/25] [Bugfix][Frontend] Keep GLM tool-call markup as content
+ without tools
+
+With --enable-auto-tool-choice and the glm47 tool parser, a request that
+offers no tools still has its output parsed for <tool_call> blocks:
+_is_valid_tool_name accepts any name when the tool list is empty, so the
+markup becomes a tool call. The serving layer then drops the tool calls
+of a request without tools, and the text the model wrote disappears.
+
+When the request offers no tools, set the engine's skip_tool_parsing so
+tool-call markup passes through as literal content (a <tool_call> that
+ends reasoning still ends it). Requests with tools, and tool_choice
+"none" with tools, behave as before.
+
+Source: knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4 @ 770d115,
+  overlay/glm47_moe.py and overlay/abstract_parser.py ("K6
+  literal-no-tools fix", MIT), after logprobz's local-inference-lab/vllm
+  #639 and #640. Re-implemented: the source rebuilt the engine config
+  without tool terminals from the facade, and also made tool_choice
+  "none" literal; this uses the engine's existing skip_tool_parsing flag
+  in the GLM parser and leaves "none" to upstream's suppression.
+Upstream: absent in v0.31.0 and main.
+Claimed gain: correctness only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/parser/glm47_moe.py | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/vllm/parser/glm47_moe.py b/vllm/parser/glm47_moe.py
+index 9a18228fb..dd3716b9a 100644
+--- a/vllm/parser/glm47_moe.py
++++ b/vllm/parser/glm47_moe.py
+@@ -233,6 +233,16 @@ class Glm47MoeParser(ParserEngine):
+         )
+         super().__init__(tokenizer, tools, **kwargs)
+ 
++    def _check_skip_tool_parsing(
++        self,
++        request: ChatCompletionRequest | ResponsesRequest,
++    ) -> None:
++        # With no tools offered, tool-call markup is literal content: there is
++        # nothing it could call, and parsing it would drop the text.
++        if not getattr(request, "tools", None):
++            self.skip_tool_parsing = True
++        super()._check_skip_tool_parsing(request)
++
+     def _emit_name_delta(self, idx: int, deltas, name: str | None) -> None:
+         if name is not None:
+             name = name.strip()

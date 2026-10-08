@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:15:33 -0400
+Subject: [PATCH 10/25] List FLASHINFER_MLA_SPARSE_SM90 after SM120 on
+ capability 12
+
+Source: MiaAI-Lab/GLM-5.3-Flash-NVFP4-Dual-DGX-Spark,
+  glm53-flash_SM121.py, step bake_sm90_on_capability_12 (MIT,
+  Copyright (c) 2026 MiaAI-Lab), via the copy vendored in
+  kindlingai/glm-5.3-flash-gx10 image/patches/ at c748079. The anchor
+  matched v0.31.0 once. Retargeted: MiaAI puts SM90 ahead of SM120; this
+  puts it after.
+Upstream status: absent.
+
+MiaAI's patch inserts FLASHINFER_MLA_SPARSE_SM90 before
+FLASHINFER_MLA_SPARSE_SM120 in the capability-12 MLA priorities, making
+the FA2 path the default on GB10. Here it goes last instead, so:
+
+- no configuration that selects SM120 today changes. Sparse-MLA models
+  on RTX 50xx / RTX PRO (head 576) keep SM120 and fp8_ds_mla, and a
+  stock FlashInfer, which cannot run FA2 with fp8 KV on SM12x, is never
+  chosen implicitly;
+- SM90 is auto-selected only where SM120 rejects the config, for example
+  --kv-cache-dtype bfloat16 or a --block-size outside SM120's {64, 256},
+  which today fails with "No valid attention backend";
+- the GB10 recipe opts in explicitly:
+    --attention-backend FLASHINFER_MLA_SPARSE_SM90 --kv-cache-dtype fp8
+  and the A/B baseline stays one flag away:
+    --attention-backend FLASHINFER_MLA_SPARSE_SM120
+
+Explicit --attention-backend selection does not consult this list; the
+list only affects auto-selection.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/platforms/cuda.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/vllm/platforms/cuda.py b/vllm/platforms/cuda.py
+index ba333d53f..c1636d793 100644
+--- a/vllm/platforms/cuda.py
++++ b/vllm/platforms/cuda.py
+@@ -133,6 +133,10 @@ def _get_backend_priorities(
+             return [
+                 AttentionBackendEnum.TRITON_MLA,
+                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
++                # FA2 on SM12x. Only auto-selected where SM120 rejects the
++                # config (e.g. a bf16 KV cache); otherwise opt in with
++                # --attention-backend FLASHINFER_MLA_SPARSE_SM90.
++                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
+             ]
+         else:
+             sparse_tail = [

@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:41:51 -0400
+Subject: [PATCH 23/25] [Core] Honor --prefill-schedule-interval without data
+ parallelism
+
+--prefill-schedule-interval N defers prefill work to one engine step in
+N while other requests decode, but only the DP engine core implements
+the throttle; the base EngineCore never throttles, so the flag does
+nothing on a single-engine deployment. There a long chunked prefill
+shares every step with the running decodes, and on GB10 a 32k prefill
+holds the decoders to ~1 tok/s.
+
+Implement the base throttle from the scheduler's own step counter, read
+before schedule() advances it. The scheduler's existing gates still
+apply: prefills run anyway when nothing is decoding or the batch is
+capacity bound (prefill_capacity_bound). The default interval of 1
+changes nothing.
+
+Source: knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4 @ 770d115,
+  overlay/glm_prefill_sched.py, E27 cadence (MIT), which credits
+  jnardiello's GLM-5.3-Flash-FP8-4-DGX-Spark-Switchless E27 (MIT) and
+  FujitsuPolycom's SparkRing non-DP EngineCore._should_throttle_prefills.
+  Re-implemented here in three lines. Not ported: E27b short-prefill
+  bypass, E27c cadence while requests are queued, E29 end-drain hold
+  and idle coalescing (scheduler-internal source edits).
+Upstream: absent in v0.31.0 and main. #57951 and #58459 (both in
+  v0.31.0) only change the long_prefill_token_threshold cap, not the
+  cadence.
+Claimed gain: knapcio (4x GB10, TP=4, cadence 8 together with E27b/c and
+  E29): decoders under a 32k prefill 1.3 -> 7.3 tok/s, "short newcomer
+  at c4 -22%", TTFT -8%, step time unchanged. Opt-in: set
+  --prefill-schedule-interval 8.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/config/scheduler.py |  7 ++++---
+ vllm/v1/engine/core.py   | 15 ++++++++++++---
+ 2 files changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index 1fb94d3ef..e83683568 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -202,9 +202,10 @@ class SchedulerConfig:
+     (the default) disables the watermark."""
+ 
+     prefill_schedule_interval: int = Field(default=1, ge=1)
+-    """For data-parallel deployments, only admit new prefill requests
+-    once every N engine steps, aligned across DP ranks, to better balance
+-    per-step forward-pass times."""
++    """Only schedule prefill work once every N engine steps while other
++    requests are decoding. With data parallelism the steps are aligned across
++    DP ranks, to better balance per-step forward-pass times; without it, this
++    keeps long prefills from stalling every decode step."""
+ 
+     async_scheduling: bool | None = None
+     """If set to False, disable async scheduling. Async scheduling helps to
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 5c09a0059..25a7baa3c 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -623,9 +623,18 @@ class EngineCore:
+             eco.scheduler_stats.iteration_details = iteration_details
+ 
+     def _should_throttle_prefills(self) -> bool:
+-        """Whether to defer new prefills this step (DP prefill balancing).
+-        Overridden by the DP engine core; never throttles otherwise."""
+-        return False
++        """Whether to defer prefill work this step.
++
++        With --prefill-schedule-interval N > 1, prefills run on one step in N
++        while other requests decode, so a long prefill does not stall every
++        decode step. The scheduler still admits them when nothing decodes or
++        it is capacity bound. The DP engine core overrides this with a step
++        counter aligned across DP ranks.
++        """
++        interval = self.vllm_config.scheduler_config.prefill_schedule_interval
++        # Before schedule() advances it; plugin schedulers may not count steps.
++        step = getattr(self.scheduler, "current_step", 0)
++        return interval > 1 and step % interval != 0
+ 
+     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+         """Schedule, execute, and make output.

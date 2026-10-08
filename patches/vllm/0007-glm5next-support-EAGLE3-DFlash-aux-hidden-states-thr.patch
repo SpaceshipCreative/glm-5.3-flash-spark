@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Jordan <scott@spaceshipcreative.com>
+Date: Thu, 8 Oct 2026 05:00:05 -0400
+Subject: [PATCH 07/25] glm5next: support EAGLE3/DFlash aux hidden states
+ through mHC
+
+GLM-5.3-Flash (Glm5NextForCausalLM / Glm5NextForConditionalGeneration)
+did not implement SupportsEagle3, so serving it with a DFlash drafter such
+as incoai/GLM-5.3-Flash-DFlash2 failed at startup with "Model does not
+support EAGLE3 interface" (eagle3_utils.set_eagle3_aux_hidden_state_layers).
+
+Declare SupportsEagle3 on both wrappers and make Glm5NextModel an
+EagleModelMixin. The aux tensor cannot be the mixin's default
+hidden_states + residual: under mHC (hc_mult=4) a non-final layer returns
+(x, residual, post, comb) and defers its hc_post into the next layer's
+fused post+pre kernel, so no plain hidden state exists at a layer
+boundary. _aux_hidden_state() completes the deferred hc_post with a
+dedicated MHCPostOp (a pure op; the layer loop keeps consuming the
+original tuple) and contracts the streams with hc_contract, exactly like
+the last mHC layer's epilogue. Non-mHC boundaries already carry the summed
+stream. Aux id L is the stream entering layer L (eagle3_utils maps the
+drafter's target_layer_ids [5, 14, 24, 33, 42] to [6, 15, 25, 34, 43]);
+id end_layer is the final, already-contracted output. Captured states are
+all-gathered and trimmed under sequence parallelism. forward returns
+(hidden_states, aux_hidden_states) only when aux layers are captured.
+
+Based on vllm-project/vllm#56983 by Shijin Zhang (@Dovis01), PR head
+306f565407 (Apache-2.0); the model.py diff applies to v0.31.0 unchanged.
+The CPU unit test is adapted from tests/models/glm5next/test_eagle3.py in
+vllm-project/vllm#55423 by @zixi-qi (Apache-2.0), retargeted at #56983's
+model-level _aux_post_op. The same hc_post + hc_contract capture is used
+by #55682 (@Leoyzen), knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4
+overlay/glm5next_model.py and the Kindling glm53_eagle3_aux patch; no code
+was taken from those.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/glm5next/common/model.py | 51 +++++++++++++++++++++++++---
+ 1 file changed, 47 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/models/glm5next/common/model.py b/vllm/models/glm5next/common/model.py
+index ffc741340..7beec5667 100644
+--- a/vllm/models/glm5next/common/model.py
++++ b/vllm/models/glm5next/common/model.py
+@@ -60,9 +60,11 @@ from vllm.model_executor.models.glm4_1v import (
+     Glm4vForConditionalGeneration,
+ )
+ from vllm.model_executor.models.interfaces import (
++    EagleModelMixin,
+     HasInnerState,
+     IsHybrid,
+     MixtureOfExperts,
++    SupportsEagle3,
+     SupportsPP,
+ )
+ from vllm.model_executor.models.utils import (
+@@ -620,7 +622,7 @@ class Glm5NextDecoderLayer(nn.Module):
+         )
+ 
+ 
+-class Glm5NextModel(nn.Module):
++class Glm5NextModel(nn.Module, EagleModelMixin):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -679,6 +681,7 @@ class Glm5NextModel(nn.Module):
+             get_layer,
+             prefix=f"{prefix}.layers",
+         )
++        self._aux_post_op = MHCPostOp()
+         # The active slice is fixed after construction; cache it so forward
+         # doesn't rebuild the slice (a fresh list) every step.
+         self._active_layers = self.layers[self.start_layer : self.end_layer]
+@@ -700,6 +703,26 @@ class Glm5NextModel(nn.Module):
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+ 
++    def _aux_hidden_state(
++        self,
++        hidden_states: torch.Tensor,
++        residual: torch.Tensor | None,
++        post: torch.Tensor | None,
++        comb: torch.Tensor | None,
++    ) -> torch.Tensor:
++        """Completed residual stream entering a layer, as one hidden vector.
++
++        mHC layers defer their final ``hc_post`` into the next layer's fused
++        pre-op, so ``hidden_states`` holds the raw layer output while the
++        widened stream is completed here and contracted back to
++        ``hidden_size``. Non-mHC layers already return the summed stream.
++        """
++        if post is None:
++            return hidden_states
++        assert residual is not None and comb is not None
++        completed = self._aux_post_op(hidden_states, residual, post, comb)
++        return hc_contract(completed, self.config.mhc_num_residual_streams)
++
+     def forward(
+         self,
+         input_ids: torch.Tensor | None,
+@@ -729,7 +752,15 @@ class Glm5NextModel(nn.Module):
+         if self.is_sequence_parallel:
+             hidden_states = sp_shard(hidden_states)
+ 
+-        for layer in self._active_layers:
++        aux_hidden_states: list[torch.Tensor] = []
++        for idx, layer in enumerate(self._active_layers, start=self.start_layer):
++            if idx in self.aux_hidden_state_layers:
++                aux_hidden_state = self._aux_hidden_state(
++                    hidden_states, residual, post, comb
++                )
++                if self.is_sequence_parallel:
++                    aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
++                aux_hidden_states.append(aux_hidden_state)
+             hidden_states, residual, post, comb = layer(
+                 positions, hidden_states, residual, post, comb
+             )
+@@ -744,10 +775,18 @@ class Glm5NextModel(nn.Module):
+                 {"hidden_states": hidden_states, "residual": residual}
+             )
+ 
++        if self.end_layer in self.aux_hidden_state_layers:
++            final_aux = self._aux_hidden_state(hidden_states, residual, post, comb)
++            if self.is_sequence_parallel:
++                final_aux = sp_all_gather(final_aux)[:full_num_tokens]
++            aux_hidden_states.append(final_aux)
++
+         if self.is_sequence_parallel:
+             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+ 
+         hidden_states = self.norm(hidden_states)
++        if aux_hidden_states:
++            return hidden_states, aux_hidden_states
+         return hidden_states
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -934,7 +973,7 @@ class Glm5NextModel(nn.Module):
+ 
+ 
+ class Glm5NextForCausalLM(
+-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
++    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid, SupportsEagle3
+ ):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+@@ -1030,7 +1069,11 @@ class Glm5NextForCausalLM(
+     dummy_inputs=Glm4vDummyInputsBuilder,
+ )
+ class Glm5NextForConditionalGeneration(
+-    Glm4vForConditionalGeneration, HasInnerState, IsHybrid, MixtureOfExperts
++    Glm4vForConditionalGeneration,
++    HasInnerState,
++    IsHybrid,
++    MixtureOfExperts,
++    SupportsEagle3,
+ ):
+     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
+     # multimodal wrapper must declare the same interfaces so vLLM treats it as
