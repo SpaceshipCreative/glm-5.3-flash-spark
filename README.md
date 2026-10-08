@@ -41,8 +41,13 @@ These come from Kindling's notes and from incident reports on NVIDIA's DGX Spark
 - **Watermarks:** set `vm.watermark_scale_factor=100`. Out of unified memory, a GB10 tends to livelock (pingable, ssh dead, power button only) rather than OOM-kill (Sparkdown_Format).
 - **earlyoom:** DGX OS's `earlyoom` (2% threshold) kills the vLLM worker on the head node, which shows up as "died unexpectedly". Disable it on serving nodes or lower its threshold (jcagle).
 - **Headless:** run `multi-user.target`. `spark.sh` already sets `--ulimit core=0`.
-- **Clocks after a crash:** a node can come back stuck near 720 MHz, which costs a TP=4 cluster about 25%; only a reboot fixes it. Check `clocks.sm` under load (tonyd).
-- **Driver, kernel and firmware:** one known-good set is kernel 6.17.0-1031-nvidia, driver 580.173.02 and ConnectX-7 firmware 28.45.4028, which gave about 109 Gb/s per rail (fernando.qi).
+- **Clocks:** a node can come back stuck at 500–800 MHz after a crash. That slows every rank, about 25% at TP=4. A reboot may not clear it; pulling AC power for 60 s recovered 24–88% (tonyd, nvidiaspark1). Check `clocks.sm` under load.
+- **Kernel, driver and firmware:**
+  - Keep them identical on every node; syncing them once gave +140% prefill and +37% decode (kimbona.dy).
+  - One known-good set is kernel 6.17.0-1031-nvidia, driver 580.173.02 and ConnectX-7 firmware 28.45.4028, which gave about 109 Gb/s per rail (fernando.qi).
+  - Kernel 7.0.0-1019 breaks RDMA memory registration above about 90 GB resident on the GPU. This recipe sits near 107 GiB, so TP=4 prefill roughly halves. Boot it with `kho=off` (`nvidia-spark-grub-kho`) or `cma=128M`, or use 6.17.0-1032 (mlau1, ForsakenSilver).
+  - DGX OS 7.6 with driver 580.178.04 has freeze reports.
+- **IOMMU:** boot with `iommu.passthrough=1`, NVIDIA's recommended setting. It took a ConnectX-7 function from 13 to 112 Gb/s and cut 32k TTFT by 27% (leafy-inn.0z; Neill, NVIDIA).
 - **NCCL:** the image's `nvidia-nccl-cu13` must stay 2.30.x. A FlashInfer nightly once downgraded it to 2.29.7, which breaks the fabric (tonyd615). `build` prints the version.
 - **Page cache:** model files in page cache can block CUDA allocations (NVRM `NV_ERR_NO_MEMORY`, tonyd615). `DROP_CACHES=1` drops caches before boot.
 - **Long uptimes:** the free-memory floor sank about 1.5 GiB a day on one TP=2 server (fernando.qi), so plan periodic restarts.
@@ -71,7 +76,10 @@ Edit `NODES`, `FABRIC_IPS` and the paths in `spark.env`, then:
 python3 gates/smoke.py --url http://spark1:8000
 ```
 
-- **`check`** prints each RDMA device's netdev, MTU and link speed.
+- **`check`** prints, per node:
+  - the kernel and its `iommu.passthrough` / `kho` / `cma` boot flags;
+  - swappiness, earlyoom, GPU clocks and the driver;
+  - each RDMA device's netdev, MTU and link speed.
 - **`build`** streams this directory to every node and builds the image there.
 - **`serve`** starts one container per node, last rank first, and waits for `/health`. The first boot JIT-compiles kernels, so allow up to an hour; later boots reuse `CACHE_DIR`.
 - **Other commands:** `stop`, `status` and `logs [rank]`.
@@ -90,7 +98,9 @@ About 90% of elements come back bit-exact, and a tensor that fails the error gat
 python3 tools/lossless8.py /models/GLM-5.3-Flash-NVFP4 /models/GLM-5.3-Flash-NVFP4-l8 --dry-run
 ```
 
-Drop `--dry-run` to write it. That takes about 148 GiB of new disk; untouched shards are hard-linked. Then point `MODEL_DIR` at the new directory. `spark.sh` already routes these layers to Marlin W8A16. Run the KL gate before serving it.
+Drop `--dry-run` to write it. That takes about 148 GiB of new disk; untouched shards are hard-linked. Then point `MODEL_DIR` at the new directory. `spark.sh` already routes these layers to Marlin W8A16.
+
+Despite the name it isn't fully lossless: about 10% of elements move. Forum reports of online FP8 / NVFP4 requantization of the same layers measured +0.003 nat/token, and about 1% NLL. So run the KL gate before serving it.
 
 ## The recipe
 
@@ -101,7 +111,7 @@ These are the `spark.sh` defaults. Kindling's numbers are on 4× GB10 with the s
 | Image | `vllm/vllm-openai:v0.31.0`, CUDA 13.0, pinned digest | CUDA 13 builds `12.0f` family kernels, which run on sm_121; the `-cu129` image builds 12.0a only and doesn't | vLLM v0.31.0 release |
 | FlashInfer | 0.7.0.post1, as pinned by vLLM, plus 4 patches | b12x's move into FlashInfer (#5767) isn't in any wheel yet and wasn't qualified on SM121 | our review of flashinfer#5767 |
 | Checkpoint | `nvidia/GLM-5.3-Flash-NVFP4` @ `da920bb` | <ul><li>Its dense layers 0–2 are NVFP4: about 3% fewer decode bytes than RedHat's.</li><li>Router bias, `A_log` and `dt_bias` are kept in F32; RedHat downcasts them and router near-ties flip.</li><li>The MTP layer is in `ignore`.</li><li>99–103% of BF16 on NVIDIA's evals.</li><li>The forum's best NVFP4 scores: 96.0 hardmode and 0.502 BPB.</li><li>vllm#54150 (the fused gate/up GEMM dequantizes both halves with the gate's scale) is a no-op here because all 12,096 gate/up scale pairs match.</li></ul> | our comparison; NVIDIA model card; ajvazan, p-pugstaller, jetspark, jahnclawdmonet (forum) |
-| Chat template | Z.ai's template @ `eb9eb208` with one change: thinking off becomes `Reasoning Effort: Low` | The model never saw an empty `<think></think>`; long outputs corrupted 3–8 of 8 times with thinking off | Kindling (finding and change) |
+| Chat template | Z.ai's template @ `eb9eb208` with one change: thinking off becomes `Reasoning Effort: Low`, whatever effort is set | The model never saw an empty `<think></think>`; long outputs corrupted 3–8 of 8 times with thinking off | Kindling (finding and change) |
 | Parallelism | TP=4 / TP=2, one server per replica | TP=4 is 1.7× faster per stream and at prefill, with 524k against 160k context | Kindling TP table |
 | Speculation | DFlash2, `k=7`, `disable_eagle_block_drop` | All three recipes use these weights at k=7. Decode at one request (code / prose / structured), stock + DFlash2 → patched: 91.3 / 38.7 / 121.9 → 117.3 / 70.5 / 164.3 tok/s | Kindling, knapcio, MiaAI |
 | MoE | `--moe-backend marlin` (W4A16) | W4A4 kernels clip activations to static input scales: 13–21% MoE output error, 62% past the calibrated amax. Marlin ignores the input scales. "Code +40%, JSON +50%" against the official recipe | knapcio, Kindling |
@@ -116,7 +126,7 @@ These are the `spark.sh` defaults. Kindling's numbers are on 4× GB10 with the s
 | Long prefills | `--long-prefill-token-threshold 2304`, `--prefill-schedule-interval 8` | A 12-token request behind a 120k prefill: 78–90 s → 4.8 s. Decode under a 32k prefill: 1.3 → 7.3 tok/s | Kindling; knapcio (cadence, after jnardiello's E27) |
 | Memory | `--gpu-memory-utilization 0.88`, `VLLM_GLM53_MEM_FRACTION=0.92`, `expandable_segments` | 0.90 boots, then wedges the box hours later; the fraction makes a runaway allocation fail one request, not the node | Kindling |
 | Indexer top-k | `per_row` plus the deterministic top-k patch | `persistent_topk` breaks past about 3.4M KV tokens; arbitrary tie-breaks made identical requests drift by up to 9.8 nats | Kindling |
-| Loading | `--safetensors-load-strategy eager` | 511 s against 690 s for lazy | Kindling |
+| Loading | `--safetensors-load-strategy eager` | 511 s against 690 s for lazy. One forum report had TP=2 nodes wedge during an eager load at about 89 GiB per rank; if that happens, add `--safetensors-load-strategy lazy` to `EXTRA_ARGS` | Kindling; xander.no (forum) |
 | Fabric | both PCIe roots in `NCCL_IB_HCA`, RoCE v2, GID unpinned, exact `*_SOCKET_IFNAME`, `NCCL_MAX_NCHANNELS=8` | <ul><li>One root tops out near 110 Gb/s; both reach 180–191 Gb/s, +11% prefill.</li><li>The GID moves across reboots.</li><li>Gloo binds 127.0.0.1 without the interface name.</li><li>8 channels: 4,905 against 4,769 tok/s at 32k.</li></ul> | Kindling; MiaAI (try 4 channels at TP=2) |
 | Host process | shm busy-wait 0.002 s instead of 1 s, `ulimit -c 0` | Faster decode and about 20 °C cooler; a core dump holds the NVIDIA RM lock | nacyot (spin wait, via Kindling), Kindling |
 | Caches | Triton / Inductor / TileLang / CUDA / FlashInfer JIT caches persisted; FlashInfer **autotune** cache wiped each boot | JIT caches cut boot 271 → 128 s. A persisted autotune cache deadlocks the next TP>1 boot on v0.31.0 (fixed on main by vllm#57635) | knapcio; Kindling |
@@ -169,15 +179,20 @@ These are the `spark.sh` defaults. Kindling's numbers are on 4× GB10 with the s
 | Switch | Default | Try | Gate on |
 |---|---|---|---|
 | `ATTN_BACKEND` | `FLASHINFER_MLA_SPARSE_SM90` | `FLASHINFER_MLA_SPARSE_SM120`, the stock path; it converts KV to `fp8_ds_mla` itself | KL, TTFT, decode |
-| `MOE_BACKEND` | `marlin` | `flashinfer_cutlass` (W4A4); `b12x` with `VLLM_B12X_MOE_FP4_FORCE_A16=1` (build with `--build-arg B12X_VERSION=1.5.0`) | KL first, then prefill and decode |
+| `MOE_BACKEND` | `marlin` | `flashinfer_cutlass` (W4A4); `b12x` with `VLLM_B12X_MOE_FP4_FORCE_A16=1` (build with `--build-arg B12X_VERSION=1.5.0`). One forum rig saw b12x corrupt output at 4–6 concurrent streams (stu.miller) | KL first at several concurrencies, then prefill and decode |
 | `VLLM_TRITON_SPARSE_MLA_PREFILL_CFG` | `64,4,1,1` (tuned at TP=4) | `64,8,1,1` or `32,8,2,1` at TP=2 | TTFT at 32k / 128k |
 | `NCCL_MAX_NCHANNELS` | 8 | 4 at TP=2 | all-reduce / all-gather latency |
 | `MAX_BATCHED` | 16384 / 8192 | 4096 at TP=2. On one TP=2 server that cut short-request TTFT behind a long prefill from 8.1 to 5.7 s, at a cost of 6% solo TTFT and 11% peak aggregate (fernando.qi) | TTFT under mixed load |
 | `SPEC_K` | 7 | 0 (no speculation), 3, 5 | Aggregate tok/s at your concurrency, on real prompts: 20-token prompts overstate it about 5× (fernando.qi). DFlash2 k=7 wins code (acceptance 0.68–0.71) and structured output but not prose (0.21–0.25), per miken. A TP=2 rig stayed flat at about 45 tok/s from 4 to 16 streams (jcagle); RecoverSSM should lift that |
-| Reasoning effort | `max` (thinking on), `low` (thinking off) | `high` per request, or as the server default: `EXTRA_ARGS='--default-chat-template-kwargs {"reasoning_effort":"high"}'` in `spark.env` (`EXTRA_ARGS` splits on spaces, so no spaces inside the JSON). On an 88-question hard set it scored the same as max, with 31% faster median turns and 13% fewer tokens (eshorb) | your own eval |
+| `SPEC_TABLE` | unset (k=7 at every batch size) | `[[1,1,7],[2,2,5],[3,64,3]]`, knapcio's table, which lowers k as concurrency rises. Forum reports: k=4 gave +8.6–20% at TP=2, and picking k by concurrency gave 1.7–1.9× at 16 streams (voktolom, jetspark). Those were without RecoverSSM, and our RecoverSSM port hasn't run with a varying k yet | aggregate tok/s at 1 / 4 / 16 streams, plus the RecoverSSM gate |
+| Prefix-cache granularity | hits on 2304-token blocks (4608 at TP=2) | `--prefix-match-unit 128 --prefix-cache-retention-interval 9216` in `EXTRA_ARGS`. The finer unit replayed about 82 tokens per agent turn instead of about half a block (florianbrede). Retained checkpoints kept 99.94% hits on 5×250k when unrelated long prompts arrived (florianbrede, another model), but each one holds a KDA state block while its request runs. The interval must be a multiple of the block; 9216 works at both TPs | hit rate and warm TTFT on agent replays; KV pool use |
+| `--long-prefill-token-threshold` at TP=2 | 2304 | 4608, the TP=2 block, in `EXTRA_ARGS`: +16% long prefill on one GLM rig (stuart.trusty), at the cost of short-request latency behind a long prefill | prefill tok/s and short-request TTFT |
+| Reasoning effort | `max` (thinking on), `low` (thinking off) | `high` per request, or as the server default: `EXTRA_ARGS='--default-chat-template-kwargs {"reasoning_effort":"high"}'` in `spark.env` (`EXTRA_ARGS` splits on spaces, so no spaces inside the JSON). Thinking off still renders `Low`. Forum results: on an 88-question hard set `high` scored the same as `max` with 31% faster median turns and 13% fewer tokens (eshorb). On TEB, `max` took about twice the wall time of `low` and scored lower, 85 against 89 (jetspark) | your own eval |
 | `VLLM_GLM53_RECOVERSSM`, `VLLM_GLM53_MHC_BF16W`, `VLLM_GLM53_SP_PREFILL`, `VLLM_GLM5NEXT_DETERMINISTIC_TOPK`, `VLLM_GLM5NEXT_DRAFT_POOL` | on | `0` | to isolate a regression |
 
-Pass env through `EXTRA_ENV` and flags through `EXTRA_ARGS` in `spark.env`.
+Pass env through `EXTRA_ENV` and flags through `EXTRA_ARGS` in `spark.env`. A flag in `EXTRA_ARGS` overrides the same flag set earlier by `spark.sh`.
+
+**Clients:** leave `repetition_penalty` at 1.0. vLLM v0.31.0 applies it to prompt tokens as well as output, and 1.2 produced word salad in long chats (mclenithan).
 
 ## Gates
 
@@ -201,6 +216,8 @@ Greedy output is not bit-reproducible across *boots* on any of these stacks, bec
 9. A long-context decode sweep (35k / 226k / 500k).
 10. The boot log's target and draft block counts, with the drafter pool on and off.
 11. Repeat a 24k prefill about ten times after mixed traffic. On another stack, DFlash2 with the hybrid cache made every other run 20–86% slower until a restart (fernando.qi).
+
+In production, watch a real completion (for example `gates/smoke.py` on a timer), not `/health`. `/health` can stay 200 while the engine is deadlocked (vllm#37729, jamieo1337).
 
 ## Not included yet
 
@@ -244,7 +261,15 @@ This recipe is mostly other people's work. Thanks to:
   - eshorb: swappiness 60 while serving;
   - emihuang and coolbho3k: compact KV layouts;
   - jahnclawdmonet: align-mode chunk clipping;
-  - tonyd: the post-crash clock drop;
+  - tonyd and nvidiaspark1: the post-crash clock drop and the AC power-cycle fix;
+  - mlau1 and ForsakenSilver: the kernel 7.0 RDMA registration bug;
+  - leafy-inn.0z and Neill (NVIDIA): `iommu.passthrough=1`;
+  - kimbona.dy: node symmetry;
+  - voktolom, jetspark and florianbrede: speculation depth, prefix-cache retention and match unit;
+  - mclenithan: repetition penalty;
+  - stuart.trusty: scheduler tuning;
+  - xander.no: eager loading at TP=2;
+  - jamieo1337: the `/health` deadlock;
   - brian361 and lewald_jens: TP=4 spec-decode and B12X stack numbers.
 
 [NOTICE](NOTICE) lists the third-party code included here and its licenses.

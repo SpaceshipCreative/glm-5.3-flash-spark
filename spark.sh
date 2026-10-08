@@ -27,7 +27,9 @@ rrun() { local h=$1; shift; ssh "$h" "$(printf '%q ' "$@")"; }
 
 # SPEC_K=0 serves without speculation (for the k sweep: 0, 3, 5, 7).
 spec_json() {
-  echo "{\"method\":\"dflash\",\"model\":\"/draft\",\"num_speculative_tokens\":${SPEC_K:-7},\"disable_eagle_block_drop\":true}"
+  # SPEC_TABLE picks k by running batch size, e.g. [[1,1,7],[2,2,5],[3,64,3]] (knapcio's).
+  local table=""; [[ -n "${SPEC_TABLE:-}" ]] && table=",\"num_speculative_tokens_per_batch_size\":${SPEC_TABLE}"
+  echo "{\"method\":\"dflash\",\"model\":\"/draft\",\"num_speculative_tokens\":${SPEC_K:-7},\"disable_eagle_block_drop\":true${table}}"
 }
 
 run_rank() {
@@ -94,9 +96,11 @@ case $cmd in
     wait ;;
   check)
     for h in "${HOSTS[@]}"; do
-      # swappiness 0-1 has wedged GB10 under NVRM OOM; DGX OS earlyoom kills the worker;
-      # a node stuck near 720 MHz after a crash needs a reboot (forum reports).
-      rrun "$h" sh -c 'echo "$(hostname) swappiness=$(cat /proc/sys/vm/swappiness) earlyoom=$(systemctl is-active earlyoom 2>/dev/null) $(nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,driver_version --format=csv,noheader)"'
+      # Forum reports: swappiness 0-1 has wedged GB10 under NVRM OOM; DGX OS earlyoom kills
+      # the worker; a node stuck at 500-800 MHz slows every rank; kernel 7.0.0-1019 breaks
+      # RDMA registration past ~90 GB unless kho=off or cma=128M; iommu.passthrough=1 is
+      # NVIDIA's recommended setting. All nodes should match on kernel and driver.
+      rrun "$h" sh -c 'echo "$(hostname) kernel=$(uname -r) $(grep -o -e "iommu.passthrough=[01]" -e "kho=[a-z]*" -e "cma=[0-9A-Za-z]*" /proc/cmdline | tr "\n" " ")swappiness=$(cat /proc/sys/vm/swappiness) earlyoom=$(systemctl is-active earlyoom 2>/dev/null) $(nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,driver_version --format=csv,noheader)"'
       for dev in ${NCCL_IB_HCA//,/ }; do
         nd=$(rrun "$h" sh -c "ls /sys/class/infiniband/$dev/device/net 2>/dev/null | head -1") || nd=""
         [[ -n $nd ]] || { echo "$h: $dev has no netdev" >&2; continue; }
